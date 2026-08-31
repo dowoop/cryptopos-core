@@ -141,7 +141,7 @@ RAILS = {
 		"rate_cents": 3_500 * 100,        # $3,500 (vault demo rate)
 		"gate_confs": 3,
 		"gate_text": "EIP-658 status == 0x1 AND confs >= 3",
-		"binding": "static address + exact-amount match in the lock window (weakest)",
+		"binding": "static address + running-total match in the lock window (weakest: any unclaimed deposit that covers an open invoice settles it, whatever it was sent for)",
 		"binding_category": NOT_UNCONDITIONAL,
 		"maturity": "works",
 		"maturity_note": "real Sepolia reads + real payer"
@@ -164,7 +164,7 @@ RAILS = {
 		"rate_cents": 100,                # $1.00 - it's a dollar stablecoin
 		"gate_confs": 3,
 		"gate_text": "EIP-658 status == 0x1 AND confs >= 3",
-		"binding": "static address + exact-amount match (token watcher reads Transfer logs)",
+		"binding": "static address + running-total match (token watcher reads Transfer logs; any covering transfer settles)",
 		"binding_category": NOT_UNCONDITIONAL,
 		"maturity": "works",
 		"maturity_note": "real Sepolia reads + real payer"
@@ -187,7 +187,7 @@ RAILS = {
 		"rate_cents": 55,                 # $0.55 (vault demo rate)
 		"gate_confs": None,               # Polygon does NOT count confs:
 		"gate_text": "tx block <= the 'finalized' block tag (Heimdall v2 - supersedes conf counting)",
-		"binding": "static address + exact-amount match in the lock window",
+		"binding": "static address + running-total match in the lock window (any covering deposit settles)",
 		"binding_category": NOT_UNCONDITIONAL,
 		"maturity": "works",
 		"maturity_note": "real Amoy reads + real payer"
@@ -214,7 +214,7 @@ RAILS = {
 		"rate_cents": 100,
 		"gate_confs": None,
 		"gate_text": "tx block <= 'finalized' tag (never conf counting on Polygon)",
-		"binding": "static address + exact-amount match (Transfer logs)",
+		"binding": "static address + running-total match (Transfer logs; any covering transfer settles)",
 		"binding_category": NOT_UNCONDITIONAL,
 		"maturity": "works",
 		"maturity_note": "real Amoy reads + real payer"
@@ -414,8 +414,8 @@ RAILS = {
 		# 29.2 s. Waiting "3 more of something" would be waiting for a
 		# thing that does not happen here.
 		"gate_confs": None,
-		"gate_text": "the recipient vault's revealed_amount rose by the"
-						" invoiced amount, in a committed transaction"
+		"gate_text": "unclaimed deposits into the recipient's XTR vault total"
+						" at least the invoiced amount, in committed transactions"
 						" (Ootle commits are final - no confirmation depth)",
 		# THE WEAKEST OF THE THREE BINDINGS THIS TREE USES, said in the
 		# same words `eth` says it, because it is the same binding.
@@ -424,7 +424,7 @@ RAILS = {
 		# contract, and `CHARTER.md` §3 makes loyalty the only contract
 		# under development. Recorded here as the upgrade it is rather
 		# than left as an absence somebody has to notice.
-		"binding": "static account + exact-amount match in the lock window"
+		"binding": "static account + running-total match in the lock window"
 					" (the eth pattern; the weakest - a payment component"
 					" taking a sale_ref would bind exactly and is a new"
 					" contract)",

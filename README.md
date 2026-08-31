@@ -23,7 +23,11 @@ exactly as a stranger's host would:
 | `cryptopos-rail-ootle` | **yes** — 3,141,592 µXTR, tx `d661a4399f3afe5bc77e0f8e03e8245a2a653eaded5d17475c93953f1090d720` |
 | `cryptopos-rail-bitcoin` | not yet |
 | `cryptopos-rail-evm` | not yet |
-| `cryptopos-rail-solana` | not yet |
+
+A Solana devnet rail exists and has settled real testnet money, but it has
+**not** been extracted into a package here and there is no
+`cryptopos-rail-solana` to install. It is named only so that its absence is
+deliberate rather than an omission a reader has to discover.
 
 That distinction is not pedantry. This project has four recorded incidents where
 a suite was fully green while the deployed code could not take a payment — a
@@ -134,7 +138,7 @@ names exist.
 | Dash testnet / TDASH | yes | no | no | Insight observer not extracted; Insight cannot prove ChainLocks |
 | Zcash testnet / TAZEC | yes | no | no | no reliable keyless address provider is configured |
 | Monero stagenet / XMR | no | no | no | held back until stagenet validation and a view-only sidecar are integrated |
-| Ootle Esmeralda / XTR | account address (no registered URI) | attributed vault deposits | committed/final | shared-account exact-amount binding; resumable indexer event cursor |
+| Ootle Esmeralda / XTR | account address (no registered URI) | attributed vault deposits | committed/final | shared-account running-total binding (see the rail package's warning); resumable indexer event cursor |
 
 This table is deliberately asymmetric. Breadth belongs in the registry;
 chargeability belongs in runtime readiness. Adding an asset never makes it
