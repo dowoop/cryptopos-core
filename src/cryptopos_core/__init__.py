@@ -4,10 +4,7 @@ The public surfaces separate mechanism from host policy:
 
     plugin   concrete network/asset identities and immutable rail values
     registry explicit built-in and installed entry-point discovery
-    catalog  every built-in rail, including honest partial capability reports
-    bitcoin  verified Bitcoin Testnet 4 observation and settlement
-    evm      verified Sepolia and Amoy observation and settlement
-    ootle    final, transaction-attributed Ootle vault deposits and settlement
+    catalog  the described rails, including honest partial capability reports
 
     rates    quoting an asset in microcents, under stricter rules when the
              money is real; converting cents to exact native units
@@ -17,8 +14,6 @@ The public surfaces separate mechanism from host policy:
              data, plus the integer unit math that reads it
     uri      a payment URI per scheme — the exact string the QR encodes
     qr       a payment URI as a module grid, ready to draw
-    chain    reading the Ootle policy tier — the promise, the ceilings, a
-             balance — without an account and without a fee
     errors   documented refusals at pricing, provider, and payment boundaries
 
 What is NOT here is deliberate: persistence, scheduling, permissions, and the
@@ -76,7 +71,7 @@ from .modes import VALID_MODES
 from .rails import RAILS, rail_for, rail_keys
 from .uri import build_uri
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
 	"RAILS",

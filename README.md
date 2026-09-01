@@ -58,12 +58,25 @@ pip install cryptopos-core
 
 ## Installable payment rails
 
+**Core drives no rails of its own.** `register_builtins()` registers the six
+*request-only* catalog entries — the chains this package can describe and build
+a payment request for, and cannot observe or settle. Every drivable rail is an
+installed package discovered through the `cryptopos.rails` entry-point group:
+`cryptopos-rail-bitcoin`, `cryptopos-rail-evm`, `cryptopos-rail-ootle`. Asking
+the registry for one without installing it raises `RailNotInstalled`, which is
+the honest answer rather than a stub.
+
+```bash
+pip install cryptopos-core cryptopos-rail-bitcoin
+```
+
 ```python
 from cryptopos_core.plugin import PaymentIntent
 from cryptopos_core.registry import RailRegistry
 
 registry = RailRegistry()
-registry.register_builtins()
+registry.register_builtins()   # six request-only catalog rails
+registry.discover()            # the installed rail packages, by entry point
 
 rail = registry.get("bitcoin:testnet4/native:btc")
 configuration = {"endpoint": "https://mempool.space/testnet4/api"}
@@ -123,28 +136,42 @@ Registration also verifies that every operation accepts the protocol's initial
 and resumed call shapes; runtime protocol checks alone only prove that method
 names exist.
 
-### Built-in scope
+### Catalogue scope
 
-| concrete network and asset | request | observe | settle | current boundary |
+**This table is the CATALOGUE, not what core drives.** Every row with a `yes`
+under observe or settle is served by a separate rail package; core alone can
+build the request and nothing else. The heading said "Built-in scope" until
+2026-08-31, which described the package as it was before the 2.0 split.
+
+| concrete network and asset | request | observe | settle | served by |
 |---|---:|---:|---:|---|
-| Bitcoin Testnet 4 / TBTC | yes | yes | 1 confirmation | Esplora genesis hash is pinned; fresh address required; Testnet 4 is reorg-prone |
-| Ethereum Sepolia / ETH | yes | yes | 3 confirmations | chain ID and successful receipt verified |
-| Ethereum Sepolia / USDC | yes | yes | 3 confirmations | Circle test contract, Transfer log, and receipt verified |
-| Polygon Amoy / USDC | yes | yes | finalized block | chain ID, Circle test contract, log, receipt, and finalized tag verified |
-| Polygon Amoy / POL | yes | no | no | native block observer has not been extracted |
-| Solana devnet / SOL | yes | no | no | URI carries a sale reference but no cluster; payer wallet must be on devnet |
-| Solana devnet / USDC | yes | no | no | devnet mint and reference are carried; observer not extracted |
-| Minotari Esmeralda / XTM | yes | no | no | payer URI exists; observation needs wallet/base-node gRPC |
-| Dash testnet / TDASH | yes | no | no | Insight observer not extracted; Insight cannot prove ChainLocks |
-| Zcash testnet / TAZEC | yes | no | no | no reliable keyless address provider is configured |
-| Monero stagenet / XMR | no | no | no | held back until stagenet validation and a view-only sidecar are integrated |
-| Ootle Esmeralda / XTR | account address (no registered URI) | attributed vault deposits | committed/final | shared-account running-total binding (see the rail package's warning); resumable indexer event cursor |
+| Bitcoin Testnet 4 / TBTC | yes | yes | 1 confirmation | `cryptopos-rail-bitcoin` |
+| Ethereum Sepolia / ETH | yes | yes | 3 confirmations | `cryptopos-rail-evm` |
+| Ethereum Sepolia / USDC | yes | yes | 3 confirmations | `cryptopos-rail-evm` |
+| Polygon Amoy / POL | yes | yes | finalized block | `cryptopos-rail-evm` |
+| Polygon Amoy / USDC | yes | yes | finalized block | `cryptopos-rail-evm` |
+| Ootle Esmeralda / XTR | account address (no registered URI) | yes | committed/final | `cryptopos-rail-ootle` |
+| Solana devnet / SOL | yes | no | no | **core, request-only** — URI carries a sale reference but no cluster |
+| Solana devnet / USDC | yes | no | no | **core, request-only** — devnet mint and reference are carried |
+| Minotari Esmeralda / XTM | yes | no | no | **core, request-only** — observation needs wallet/base-node gRPC |
+| Dash testnet / TDASH | yes | no | no | **core, request-only** — Insight cannot prove ChainLocks |
+| Zcash testnet / TAZEC | yes | no | no | **core, request-only** — no keyless address provider configured |
+| Monero stagenet / XMR | no | no | no | **core** — held back until stagenet validation and a view-only sidecar |
+
+The six request-only rows are what `register_builtins()` returns. The six
+drivable rows are entry points, and **none of them is present until its package
+is installed**: verified by enumerating `cryptopos.rails` against an environment
+holding all four distributions.
+
+Per-rail boundaries — genesis-hash pinning, chain-ID verification, reorg
+exposure, and Ootle's two bindings — are in each rail package's own README,
+where they can be revised with the code they describe.
 
 This table is deliberately asymmetric. Breadth belongs in the registry;
 chargeability belongs in runtime readiness. Adding an asset never makes it
 settleable by implication.
 
-Bitcoin Testnet 4 remains the concrete built-in rail because [BIP 95's proposed
+Bitcoin Testnet 4 is the network `cryptopos-rail-bitcoin` drives because [BIP 95's proposed
 Testnet 5](https://bips.dev/95/) is still a draft and does not yet define a
 genesis block. Bitcoin
 test-network addresses share an address format, and BIP-21 does not name the
@@ -269,7 +296,7 @@ Reads need no account and cost nothing, which is the whole point: a merchant's
 promise is checkable by the customer holding the card, from any machine.
 
 ```python
-from cryptopos_core.chain import OotleReader, ceilings_wording
+from cryptopos_rail_ootle.chain import OotleReader, ceilings_wording
 
 reader = OotleReader(loyalty_component="component_abc...")
 
@@ -375,7 +402,7 @@ Every chain read is stubbed. A suite that needed a live indexer could not
 assert the thing that matters most here — what happens when the indexer is
 gone — so there is no network in it and there must never be one.
 
-579 tests, no network, well under a second. Two installed-distribution checks
+444 tests, no network, well under a second. Two installed-distribution checks
 skip from a source-only run and execute against the built wheel.
 
 Two of the tests are guards rather than tests of behaviour: one parses every

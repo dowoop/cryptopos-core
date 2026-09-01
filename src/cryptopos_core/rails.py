@@ -414,20 +414,27 @@ RAILS = {
 		# 29.2 s. Waiting "3 more of something" would be waiting for a
 		# thing that does not happen here.
 		"gate_confs": None,
-		"gate_text": "unclaimed deposits into the recipient's XTR vault total"
-						" at least the invoiced amount, in committed transactions"
-						" (Ootle commits are final - no confirmation depth)",
-		# THE WEAKEST OF THE THREE BINDINGS THIS TREE USES, said in the
-		# same words `eth` says it, because it is the same binding.
-		# Ootle CAN do better - a component method taking a sale
-		# reference would bind exactly - but that is a new smart
-		# contract, and `CHARTER.md` §3 makes loyalty the only contract
-		# under development. Recorded here as the upgrade it is rather
-		# than left as an absence somebody has to notice.
-		"binding": "static account + running-total match in the lock window"
-					" (the eth pattern; the weakest - a payment component"
-					" taking a sale_ref would bind exactly and is a new"
-					" contract)",
+		"gate_text": "with a payment component: deposits naming THIS sale's"
+					" reference total at least the invoiced amount. Without one:"
+					" unclaimed deposits into the recipient's XTR vault do."
+					" Committed transactions only, and Ootle commits are final -"
+					" no confirmation depth",
+		# TWO BINDINGS, AND THE ROW DECIDES WHICH. Until 2026-08-31 this
+		# said only the first, and added that a component taking a sale
+		# reference "would bind exactly and is a new contract". It is no
+		# longer new: it was written, attacked, deployed to esmeralda and
+		# paid by a stranger's own key the same day.
+		#
+		# Said at the ADAPTER's level, not the deployment's: whether this
+		# rail binds per sale depends on whether the host configures a
+		# payment component, and no static table can know that. A host that
+		# reports a binding must compute it from its own configuration.
+		"binding": "per-sale when the rail names a payment component - the"
+					" payer passes the sale reference to the component's `pay`"
+					" method, so the money itself says which sale it settles."
+					" Without one it falls back to a static account and a"
+					" running-total match in the lock window: the eth pattern,"
+					" and the weakest",
 		"binding_category": NOT_UNCONDITIONAL,
 		"maturity": "partial",
 		"maturity_note": "real esmeralda reads over the same HTTPS+JSON"

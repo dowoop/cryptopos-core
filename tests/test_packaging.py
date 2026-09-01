@@ -104,21 +104,26 @@ class Dependencies(unittest.TestCase):
 			self.skipTest("running from the source tree, not an installed distribution")
 		self.assertIn(declared, (None, []), f"declares {declared}")
 
-	def test_installed_version_and_rail_entry_points_match_the_source(self):
+	def test_core_advertises_no_drivable_rails_of_its_own(self):
+		"""THE 2.0 SPLIT, asserted rather than described.
+
+		Core describes chains and drives none of them: every drivable adapter
+		lives in a rail package discovered through the `cryptopos.rails` entry
+		point group. So core itself must advertise nothing in that group, and
+		a single entry appearing here would mean the boundary had leaked back.
+
+		Until 2026-08-31 this test asserted the OPPOSITE -- four entry points
+		naming `cryptopos_core.bitcoin` and `cryptopos_core.evm`, modules the
+		2.0 split had already removed. It had been failing since, which is
+		what a suite written against an architecture that has moved looks
+		like: not a wrong answer, a question nobody was asking any more.
+		"""
 		distribution = self.installed_distribution()
 		self.assertEqual(distribution.version, cryptopos_core.__version__)
 		points = {
 			point.name: point.value for point in distribution.entry_points if point.group == "cryptopos.rails"
 		}
-		self.assertEqual(
-			points,
-			{
-				"bitcoin-testnet4": "cryptopos_core.bitcoin:bitcoin_testnet4",
-				"ethereum-sepolia-eth": "cryptopos_core.evm:ethereum_sepolia",
-				"ethereum-sepolia-usdc": "cryptopos_core.evm:usdc_ethereum_sepolia",
-				"polygon-amoy-usdc": "cryptopos_core.evm:usdc_polygon_amoy",
-			},
-		)
+		self.assertEqual(points, {})
 
 
 class FrameworkFree(unittest.TestCase):

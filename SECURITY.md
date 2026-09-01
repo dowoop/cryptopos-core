@@ -83,11 +83,18 @@ expiry enters review instead of settlement.
 * **That the policy tier read is mainnet.** The default indexer is testnet and
   there is no published mainnet one. `promise()` returns the indexer that
   answered; display it.
-* **Per-sale binding for Ootle's shared account.** Esmeralda's filtered vault
+* **Per-sale binding for Ootle's SHARED account.** Esmeralda's filtered vault
   event stream attributes each final deposit to a transaction ID and exact
   amount, so the claimed-transaction set prevents double credit. It does not
-  give the payment a sale reference or unique recipient: attribution still
-  relies on the static account plus exact amount inside the lock window.
+  give the payment a sale reference or a unique recipient: attribution is by
+  RUNNING TOTAL inside the lock window, so whichever open sale polls first
+  takes whatever unclaimed money covers it. This paragraph said "exact amount"
+  until 2026-08-31, which is a stronger and false claim — unique per-sale
+  amounts are not a remedy for a total.
+  A host that configures `cryptopos-rail-ootle` with a **payment component**
+  does get a per-sale binding: the payer names the sale on the transfer and
+  only deposits carrying that reference are credited. Which of the two a
+  deployment has is the host's configuration, not this package's to state.
 * **The payer wallet's Bitcoin or Solana network selection.** BIP-21 does not
   encode Testnet 4, and Solana Pay does not encode a cluster. The observer is
   network-verified; the host must still tell the payer which wallet network to
