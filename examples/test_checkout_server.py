@@ -901,6 +901,26 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 					f"ethereum:{self._usdc().asset.reference}@80002/{function}"
 					f"?address={merchant}&uint256=1")
 
+	def test_a_bitcoin_uri_carrying_bip72_r_is_refused(self):
+		"""`r` does not decorate the instruction, it REPLACES it: a capable
+		wallet ignores the address and amount and fetches a PaymentRequest
+		from that URL, which may name any output and need not be signed."""
+		class Btc:
+			key = "bitcoin:testnet4/native:btc"
+
+			class network:
+				namespace, reference, is_testnet = "bitcoin", "testnet4", True
+
+			class asset:
+				namespace, reference = "native", "btc"
+
+		address = "tb1qp5wfcq48h6d63wyy9qz0awtpfqwwv4smhppgv3"
+		app._check_payment_identity(Btc, None, address, f"bitcoin:{address}?amount=0.001")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				Btc, None, address,
+				f"bitcoin:{address}?amount=0.001&r=https%3A%2F%2Fattacker.example%2Freq")
+
 	def test_a_native_evm_uri_calling_a_function_is_refused(self):
 		"""A native send calls nothing. A URI that pays the merchant AND names
 		a function is instructing something the host never checked."""

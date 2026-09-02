@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Fifteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety defects. Nothing in the payment protocol
+Sixteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found ninety-one defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -315,6 +315,13 @@ and the checks that keep them honest.
   no transaction. Settlement asks first whether timely, mature, unclaimed money
   covers the invoice. The extra still needs reconciling; it does not unpay the
   customer.
+* A sixteenth round found one more: **a URI parameter can replace the
+  instruction rather than decorate it.** BIP-72's `r` tells a capable wallet to
+  disregard the address and amount and fetch a PaymentRequest from a URL, which
+  may name any output it likes and need not be signed -- so a URI carrying the
+  merchant's own address passed every check while sending the customer's money
+  somewhere else. Query parameters are whitelisted per namespace now, so an
+  unrecognised one is refused rather than ignored.
 
 ## 2.1.1
 

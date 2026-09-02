@@ -318,9 +318,13 @@ example parses the URI and checks the whole payment identity: the scheme, the
 chain id, the token contract for an ERC-20 rail, and the address the money
 actually reaches. A destination check alone was not enough — a URI paying an
 attacker can mention the merchant in a note, and `@1` on a Sepolia sale sends
-the customer to mainnet, where the same address exists. What remains trusted is
-the **amount** the URI encodes, and a network whose scheme the example has no
-parser for is refused rather than shown to a payer. A
+the customer to mainnet, where the same address exists. Query parameters are
+whitelisted rather than ignored, because some of them replace the instruction
+instead of decorating it — BIP-72's `r` tells a capable wallet to disregard the
+address entirely and fetch a payment request from a URL, which may name any
+output and need not be signed. What remains trusted is the **amount** the URI
+encodes, and a network whose scheme the example has no parser for is refused
+rather than shown to a payer. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state

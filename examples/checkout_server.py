@@ -612,6 +612,19 @@ DEMO_XPUB = ("xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZ
 #: destination address is identical on all of them.
 EVM_CHAIN_IDS = {("ethereum", "sepolia"): "11155111", ("polygon", "amoy"): "80002"}
 
+#: Query parameters a payment URI may carry, per namespace. A WHITELIST,
+#: because some parameters do not decorate an instruction, they REPLACE it:
+#: BIP-72's `r` tells a capable wallet to ignore the address and amount
+#: entirely and fetch a PaymentRequest from a URL, which may name any output
+#: it likes and need not be signed. The address in front of it is then
+#: decoration, and the sale watches an address nobody was ever told to pay.
+URI_PARAMETERS = {
+	"memory": {"amount"},
+	"bitcoin": {"amount", "label", "message"},
+	"ethereum": {"value", "gas", "gasLimit", "gasPrice"},
+	"polygon": {"value", "gas", "gasLimit", "gasPrice"},
+}
+
 #: The URI scheme each namespace must use. `bitcoin:` and `ethereum:` addresses
 #: do not overlap, but nothing stops a defective rail emitting the wrong one.
 URI_SCHEMES = {"memory": "memory", "bitcoin": "bitcoin",
@@ -651,6 +664,16 @@ def _check_payment_identity(rail, intent, through, uri):
 	# cannot tell them apart because it throws the order away.
 	arguments = parse_qsl(urlparse(uri).query, keep_blank_values=True)
 	query = parse_qs(urlparse(uri).query)
+
+	allowed = URI_PARAMETERS[namespace]
+	if rail.asset.namespace == "erc20":
+		allowed = {"address", "uint256"}
+	unknown = sorted(set(query) - allowed)
+	if unknown:
+		raise ValueError(
+			f"the payment URI carries {unknown}, which this host does not understand. "
+			f"Some parameters replace the instruction rather than decorate it -- BIP-72's "
+			f"`r` sends the wallet to fetch a different payment request entirely")
 
 	if namespace in ("ethereum", "polygon"):
 		wanted_chain = EVM_CHAIN_IDS.get((namespace, rail.network.reference))
