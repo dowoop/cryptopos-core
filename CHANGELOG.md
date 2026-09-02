@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Sixteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-one defects. Nothing in the payment protocol
+Seventeen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found ninety-two defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -322,6 +322,12 @@ and the checks that keep them honest.
   merchant's own address passed every check while sending the customer's money
   somewhere else. Query parameters are whitelisted per namespace now, so an
   unrecognised one is refused rather than ignored.
+* A seventeenth round found the same shape once more, in the parameters the
+  whitelist had allowed: **ERC-681's `gasPrice` and `gasLimit` are fee
+  instructions.** A one-wei invoice carrying `gas=21000&gasPrice=10**15` costs
+  the payer twenty-one ETH in fees, the merchant receives their one wei, and
+  the sale settles perfectly -- an enormous loss invisible to every check. The
+  gas fields are refused; a wallet can estimate its own fee.
 
 ## 2.1.1
 

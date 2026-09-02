@@ -621,8 +621,14 @@ EVM_CHAIN_IDS = {("ethereum", "sepolia"): "11155111", ("polygon", "amoy"): "8000
 URI_PARAMETERS = {
 	"memory": {"amount"},
 	"bitcoin": {"amount", "label", "message"},
-	"ethereum": {"value", "gas", "gasLimit", "gasPrice"},
-	"polygon": {"value", "gas", "gasLimit", "gasPrice"},
+	# NO GAS FIELDS. ERC-681 lets a URI suggest `gasPrice` and `gasLimit`, and
+	# a wallet that honours them will. A one-wei invoice carrying
+	# `gas=21000&gasPrice=10**15` costs the customer twenty-one ETH in fees,
+	# the merchant receives their one wei, and the sale settles perfectly --
+	# the loss is real, enormous, and invisible to everything the host checks.
+	# Let the wallet estimate its own fee.
+	"ethereum": {"value"},
+	"polygon": {"value"},
 }
 
 #: The URI scheme each namespace must use. `bitcoin:` and `ethereum:` addresses

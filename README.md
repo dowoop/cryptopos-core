@@ -319,10 +319,12 @@ chain id, the token contract for an ERC-20 rail, and the address the money
 actually reaches. A destination check alone was not enough — a URI paying an
 attacker can mention the merchant in a note, and `@1` on a Sepolia sale sends
 the customer to mainnet, where the same address exists. Query parameters are
-whitelisted rather than ignored, because some of them replace the instruction
-instead of decorating it — BIP-72's `r` tells a capable wallet to disregard the
-address entirely and fetch a payment request from a URL, which may name any
-output and need not be signed. What remains trusted is the **amount** the URI
+whitelisted rather than ignored, because some of them are not decoration.
+BIP-72's `r` tells a capable wallet to disregard the address entirely and fetch
+a payment request from a URL, which may name any output and need not be signed;
+ERC-681's `gasPrice` and `gasLimit` are fee *instructions*, and a one-wei
+invoice carrying them can cost the payer twenty-one ETH in fees while the sale
+settles perfectly. Both are refused — a wallet can estimate its own fee. What remains trusted is the **amount** the URI
 encodes, and a network whose scheme the example has no parser for is refused
 rather than shown to a payer. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from

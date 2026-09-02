@@ -901,6 +901,28 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 					f"ethereum:{self._usdc().asset.reference}@80002/{function}"
 					f"?address={merchant}&uint256=1")
 
+	def test_an_evm_uri_suggesting_a_fee_is_refused(self):
+		"""ERC-681 lets a URI suggest gasPrice and gasLimit, and a wallet that
+		honours them will. A one-wei invoice can cost the customer twenty-one
+		ETH in fees while the sale settles perfectly."""
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+
+		class Sepolia:
+			key = "ethereum:sepolia/native:eth"
+
+			class network:
+				namespace, reference, is_testnet = "ethereum", "sepolia", True
+
+			class asset:
+				namespace, reference = "native", "eth"
+
+		app._check_payment_identity(Sepolia, None, merchant,
+		                            f"ethereum:{merchant}@11155111?value=1")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				Sepolia, None, merchant,
+				f"ethereum:{merchant}@11155111?value=1&gas=21000&gasPrice=1000000000000000")
+
 	def test_a_bitcoin_uri_carrying_bip72_r_is_refused(self):
 		"""`r` does not decorate the instruction, it REPLACES it: a capable
 		wallet ignores the address and amount and fetches a PaymentRequest
