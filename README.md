@@ -187,7 +187,8 @@ Show that URI to the customer. Time passes; the chain moves; the money arrives:
 ```python
 chain["tip"] = 100
 chain["transfers"] = [
-    {"id": "tx-a", "to": "mem1alice", "amount": 250, "confs": 3, "height": 71},
+    {"id": "tx-a", "to": "mem1alice", "amount": 250, "confs": 3,
+     "height": 71, "at": 1_787_101_000},        # inside the payment window
 ]
 ```
 
@@ -232,8 +233,10 @@ transaction id would refuse the *other* sale it legitimately paid:
 ```python
 alice, bob = "mem1alice", "mem1bob"
 batched = {**chain, "tip": 140, "transfers": [
-    {"id": "batch-1", "to": alice, "amount": 250, "confs": 3, "height": 120},
-    {"id": "batch-1", "to": bob, "amount": 400, "confs": 3, "height": 120},
+    {"id": "batch-1", "to": alice, "amount": 250, "confs": 3, "height": 120,
+     "at": 1_787_101_000},
+    {"id": "batch-1", "to": bob, "amount": 400, "confs": 3, "height": 120,
+     "at": 1_787_101_000},
 ]}
 
 def sale_at(name, recipient, amount):
@@ -309,7 +312,10 @@ address and is not; there isn't one.
 gives you `cryptopos_core.testing`, which every recipe here uses; clone the
 repository for the server.)
 
-**Three things the example cannot do for you, stated rather than implied.** A
+**Four things the example cannot do for you, stated rather than implied.** The
+`PaymentRequest` fields beside a URI are metadata, not proof of it: the example
+checks that the URI names the address (or component) the money must go through,
+and past that it trusts the rail to encode its own amount honestly. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state
@@ -654,8 +660,8 @@ a person on the first hiccup:
 
 ```python
 doubted = {**chain, "transfers": [
-    {"id": "tx-?", "to": "mem1alice", "amount": 250, "confs": 3,
-     "height": 71, "unreadable": True},      # the provider was asked; it did not answer
+    {"id": "tx-?", "to": "mem1alice", "amount": 250, "confs": 3, "height": 71,
+     "unreadable": True},                    # the provider was asked; it did not answer
 ]}
 rail.settle(intent, rail.observe(intent, doubted)).state
 #   -> 'pending'
@@ -739,7 +745,8 @@ they are the bugs that cost money.
 ```python
 def scripted(*transfers, tip=100, page=1000):
     return {"endpoint": "memory://", "tip": tip, "page": page,
-            "transfers": [dict(to="mem1alice", confs=3, **t) for t in transfers]}
+            "transfers": [dict(to="mem1alice", confs=3, at=1_787_101_000, **t)
+                          for t in transfers]}
 ```
 
 **A payment that arrives in two parts settles once it is whole:**

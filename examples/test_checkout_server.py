@@ -217,6 +217,21 @@ class TheGapLimitIsDefended(Harness):
 		finally:
 			app.UNPAID_RUN_LIMIT = original
 
+	def test_money_short_of_settlement_still_marks_the_address_used(self):
+		"""A part payment, a late one, or one under review all put money at
+		that address. Advancing only on `settled` left it looking unused, and
+		the backpressure counter then over-reported the gap."""
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
+		try:
+			first = app.start_sale(100)
+			self.pay(first, 100, 71, "arrived-late", at=first["expires_at"] + 1)
+			self.assertEqual(app.poll_once(first).state, "needs-review")
+			for _ in range(2):
+				app.start_sale(1)
+			self.assertIsNotNone(app.start_sale(1))    # index 0 counts as used
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
 	def test_a_payment_at_the_top_shortens_the_unused_run(self):
 		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
 		try:
@@ -249,7 +264,7 @@ class TheDoubleModelsRealChainStates(Harness):
 		app.CONFIG["tip"] = 100
 		app.CONFIG["transfers"].append({
 			"id": "in-the-mempool", "to": sale["recipient"], "amount": 250,
-			"confs": 0, "height": 71})
+			"confs": 0, "height": 71, "at": sale["expires_at"] - 60})
 		result = app.poll_once(sale)
 		self.assertEqual(result.state, "pending")
 		self.assertEqual(result.sighted_native, 250)
@@ -262,7 +277,7 @@ class TheDoubleModelsRealChainStates(Harness):
 		app.CONFIG["tip"] = 100
 		app.CONFIG["transfers"].append({
 			"id": "still-maturing", "to": sale["recipient"], "amount": 250,
-			"confs": 0, "height": 71})
+			"confs": 0, "height": 71, "at": sale["expires_at"] - 60})
 		now = int(time.time())
 		app.SALES._sales[sale["id"]]["expires_at"] = now - 1
 		app._watch_one_pass(now + app.MATURATION_GRACE_SECONDS + 1)
@@ -275,7 +290,7 @@ class TheDoubleModelsRealChainStates(Harness):
 		sale = app.start_sale(250)
 		app.CONFIG["tip"] = 100
 		unconfirmed = {"id": "maturing", "to": sale["recipient"], "amount": 250,
-		               "confs": 0, "height": 71}
+		               "confs": 0, "height": 71, "at": sale["expires_at"] - 60}
 		app.CONFIG["transfers"].append(unconfirmed)
 		now = int(time.time())
 		app.SALES._sales[sale["id"]]["expires_at"] = now - 1
@@ -572,6 +587,19 @@ class NoSaleIsHandedOutUnwatched(Harness):
 		self.assertEqual(len(app.SALES.in_review()), 1)
 
 
+class ArrivalTimeIsNotOptional(Harness):
+	def test_a_confirmed_transfer_without_an_arrival_time_is_refused(self):
+		"""Treating an unknown arrival as timely is how a payment made after
+		the window settles anyway."""
+		sale = app.start_sale(100)
+		app.CONFIG["tip"] = 100
+		app.CONFIG["transfers"].append({
+			"id": "no-time", "to": sale["recipient"], "amount": 100,
+			"confs": 3, "height": 71})            # deliberately no "at"
+		with self.assertRaises(Exception):
+			app.poll_once(sale)
+
+
 class OneWorkerOwnsASale(Harness):
 	def test_a_lease_stops_a_second_worker_touching_the_same_sale(self):
 		"""A conditional write is not enough: two workers reading the chain a
@@ -579,18 +607,36 @@ class OneWorkerOwnsASale(Harness):
 		evidence -- a `needs-review` from a stale read can beat a `settled`."""
 		sale = app.start_sale(100)
 		now = int(time.time())
-		self.assertTrue(app.SALES.lease(sale["id"], now))
-		self.assertFalse(app.SALES.lease(sale["id"], now))
-		app.SALES.release(sale["id"])
-		self.assertTrue(app.SALES.lease(sale["id"], now))
+		token = app.SALES.lease(sale["id"], now)
+		self.assertIsNotNone(token)
+		self.assertIsNone(app.SALES.lease(sale["id"], now))
+
+		# A worker whose observation outlived its lease must not release the
+		# lease its successor now holds, nor write through it.
+		app.SALES.release(sale["id"], "a-stale-token")
+		self.assertIsNone(app.SALES.lease(sale["id"], now))
+		self.assertEqual(
+			app.SALES.record(sale["id"], SettlementDecision("needs-review", 0, 0), "stale"),
+			app.ALREADY_DECIDED)
+
+		app.SALES.release(sale["id"], token)
+		self.assertIsNotNone(app.SALES.lease(sale["id"], now))
 
 	def test_a_leased_sale_is_skipped_by_the_sweep(self):
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "paid")
-		app.SALES.lease(sale["id"], int(time.time()))       # someone else owns it
+		held = app.SALES.lease(sale["id"], int(time.time()))    # someone else owns it
+
+		# It must not even be OBSERVED. Fencing stops a stale write; skipping
+		# stops the wasted provider read that would produce one.
+		reads = []
+		original = app.RAIL.observe
+		app.RAIL.observe = lambda *a, **k: (reads.append(1), original(*a, **k))[1]
 		app._watch_one_pass(int(time.time()))
+		self.assertEqual(reads, [])
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
-		app.SALES.release(sale["id"])
+
+		app.SALES.release(sale["id"], held)
 		app._watch_one_pass(int(time.time()))
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "settled")
 
@@ -606,6 +652,22 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 			                     request.amount_native, request.payer_notice)
 
 		app.RAIL.create_request = wrong
+		with self.assertRaises(ValueError):
+			app.start_sale(100)
+
+	def test_a_uri_naming_another_address_is_refused(self):
+		"""The three fields beside a URI are metadata, not proof of it: a
+		request naming the right recipient while its URI names another address
+		passes a tuple comparison and sends the money elsewhere."""
+		original = app.RAIL.create_request
+
+		def swap_uri(intent):
+			request = original(intent)
+			return type(request)(request.rail_key, "memory:mem1attacker?amount=1",
+			                     request.recipient, request.amount_native,
+			                     request.payer_notice)
+
+		app.RAIL.create_request = swap_uri
 		with self.assertRaises(ValueError):
 			app.start_sale(100)
 

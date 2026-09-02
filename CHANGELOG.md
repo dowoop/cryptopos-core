@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Nine rounds of adversarial review of the cookbook, the reference example and
-the gate over both found seventy-four defects. Nothing in the payment protocol
+Ten rounds of adversarial review of the cookbook, the reference example and
+the gate over both found eighty defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -222,6 +222,32 @@ and the checks that keep them honest.
     than implied away: a BIP-32 key cannot prove its own derivation path, a
     restored older state file is valid JSON that rolls the allocator backwards,
     and late money is never misattributed but is not recovered either.
+* A tenth round found six more:
+  - **The request check verified metadata, not the instruction.** Comparing a
+    `PaymentRequest`'s rail, recipient and amount passes for a request whose
+    URI names an entirely different address -- and the URI is what the
+    customer's money follows. The example now checks the URI names the address,
+    or the component, the money must go through, and says plainly that past
+    that it trusts the rail to encode its own amount honestly.
+  - **The lease was not exclusive.** It held a deadline and no owner, so a
+    worker whose observation outlived its lease released the lease its
+    successor held, and every terminal method accepted the write because none
+    asked who owned the sale. Leases carry a fencing token now, and `record`,
+    `review` and `expire` refuse a write that does not hold it.
+  - **A confirmed transfer with no arrival time was credited as timely**, so a
+    payment made after the window settled simply because the script did not say
+    when it landed. `MemoryRail` refuses to script one.
+  - `highest_paid` advanced only on a settled sale, so a part payment, a late
+    one, or one under review left its address looking unused and the gap
+    counter over-reported. Any sighted money marks the address used.
+  - The mid-request health failure recorded "the window closed with 0 sighted"
+    for a sale seconds old, and committed a static deployment's one permitted
+    allocation for a QR nobody was shown. It records what actually happened and
+    releases the reservation.
+  - The wheel check picked `wheels[-1]` from a directory that may hold several;
+    ambiguity is refused rather than resolved. And the `- why` text after an
+    exception name in a `raises` block is documented as a note for the reader
+    rather than something the gate reads.
 
 ## 2.1.1
 

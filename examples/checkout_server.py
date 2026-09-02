@@ -161,7 +161,7 @@ class Sales:
 			return frozenset(tx for (rail, at, tx) in self._credited
 			                 if (rail, at) == (RAIL.key, recipient))
 
-	def record(self, sale_id, decision):
+	def record(self, sale_id, decision, token=None):
 		"""Claim the transactions and write the state, or do neither.
 
 		Returns CLAIMED, CONFLICT (another sale owns one of these ids), or
@@ -172,6 +172,8 @@ class Sales:
 		with self._lock:
 			sale = self._sales[sale_id]
 			if sale["state"] != "pending":
+				return ALREADY_DECIDED
+			if sale["lease"] is not None and not self._holds(sale, token):
 				return ALREADY_DECIDED
 			mine = {(RAIL.key, sale["recipient"], tx) for tx in decision.transaction_ids}
 			if self._credited.intersection(mine):
@@ -184,17 +186,19 @@ class Sales:
 			self._credited.update(mine)                       # claimed with the write
 			return CLAIMED
 
-	def review(self, sale_id, result):
+	def review(self, sale_id, result, token=None):
 		"""Hand a sale to a person, with what was actually seen."""
 		with self._lock:
 			sale = self._sales[sale_id]
-			if sale["state"] != "pending":
+			if sale["state"] != "pending" or (
+					sale["lease"] is not None and not self._holds(sale, token)):
 				return False
 			sale["state"] = "needs-review"
 			sale["sighted_native"] = result.sighted_native
 			sale["credited_native"] = result.credited_native
-			sale["reason"] = (f"the window closed with {result.sighted_native} sighted and "
-			                  f"{result.credited_native} creditable")
+			sale["reason"] = result.reason or (
+				f"the window closed with {result.sighted_native} sighted and "
+				f"{result.credited_native} creditable")
 			return True
 
 	def lease(self, sale_id, now, seconds=30):
@@ -212,20 +216,31 @@ class Sales:
 		with self._lock:
 			sale = self._sales.get(sale_id)
 			if sale is None or sale["state"] != "pending" or now < sale["leased_until"]:
-				return False
-			sale["leased_until"] = now + seconds
-			return True
+				return None
+			# A FENCING TOKEN, not just a deadline. A worker whose observation
+			# outlived its lease came back and released the lease a SECOND
+			# worker was holding, and every terminal method accepted its write
+			# because none of them asked who owned the sale -- which is the
+			# first-writer-wins problem the lease was added to remove.
+			token = uuid.uuid4().hex
+			sale["leased_until"], sale["lease"] = now + seconds, token
+			return token
 
-	def release(self, sale_id):
+	def _holds(self, sale, token):
+		return token is not None and sale.get("lease") == token
+
+	def release(self, sale_id, token):
 		with self._lock:
-			if sale_id in self._sales:
-				self._sales[sale_id]["leased_until"] = 0
+			sale = self._sales.get(sale_id)
+			if sale is not None and self._holds(sale, token):
+				sale["leased_until"], sale["lease"] = 0, None
 
-	def expire(self, sale_id, now):
+	def expire(self, sale_id, now, token=None):
 		"""Stop watching a sale whose window closed with nothing in it."""
 		with self._lock:
 			sale = self._sales[sale_id]
-			if sale["state"] != "pending" or now < sale["expires_at"]:
+			if sale["state"] != "pending" or now < sale["expires_at"] or (
+					sale["lease"] is not None and not self._holds(sale, token)):
 				return False
 			sale["state"] = "expired"
 			sale["reason"] = "the payment window closed with nothing received"
@@ -617,28 +632,40 @@ def _open_sale(sale_id, amount_native, index, recipient):
 	if (request.rail_key, request.recipient, request.amount_native) != (
 			intent.rail_key, intent.recipient, intent.amount_native):
 		raise ValueError("the rail returned a payment request for a different payment")
+	# AND THE URI ITSELF, because those three fields are metadata beside the
+	# instruction rather than proof of it: a request naming the right recipient
+	# while its URI names another address passes the tuple check and sends the
+	# customer's money elsewhere. Where a rail pays THROUGH a component rather
+	# than to an address (Ootle), that component is what must appear.
+	through = baseline.payment_component or intent.recipient
+	if through not in request.uri:
+		raise ValueError(f"the payment URI does not name {through!r}; "
+		                 f"it is the instruction, and the fields beside it are not proof of it")
 	sale = SALES.create({
 		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
 		"credited_native": 0, "sighted_native": 0, "transaction_ids": [],
-		"expires_at": intent.expires_at_epoch, "leased_until": 0,
+		"expires_at": intent.expires_at_epoch, "leased_until": 0, "lease": None,
 		"recipient": recipient, "index": index, "notice": request.payer_notice,
 	})
 	# The address is spent HERE: the sale exists and its instruction is about
 	# to be shown. Committing at allocation meant one provider outage during
 	# `capture_baseline` permanently disabled a static deployment.
-	RECIPIENTS.commit(sale_id)
 	if not HEALTH["watching"]:
 		# The watcher died while this request was inside `capture_baseline`.
 		# Checking health once, on the way in, let a customer be handed a live
-		# QR that nothing was left to watch. The address is already spent, so
-		# the sale cannot be withdrawn -- it goes straight to a person.
-		SALES.review(sale_id, PollResult("pending", 0, 0, (), "no watcher"))
+		# QR that nothing was left to watch. Nothing has been shown yet, so the
+		# static reservation is NOT committed -- `close()` releases it -- and
+		# the derived index is spent, which is the honest cost of having built
+		# the request at all.
+		SALES.review(sale_id, PollResult("pending", 0, 0, (), "the watcher stopped "
+		                                 "before this sale was shown to anyone"))
 		raise Unhealthy(HEALTH["why"])
+	RECIPIENTS.commit(sale_id)
 	return sale
 
 
-def poll_once(sale):
+def poll_once(sale, token=None):
 	"""One full observation cycle for one sale, then a settlement decision."""
 	intent = sale["intent"]
 
@@ -658,9 +685,12 @@ def poll_once(sale):
 		return PollResult("pending", decision.credited_native, decision.sighted_native,
 		                  (), decision.reason)
 
-	outcome = SALES.record(sale["id"], decision)
+	outcome = SALES.record(sale["id"], decision, token)
 	if outcome == CLAIMED:
-		if decision.state == "settled":
+		if decision.sighted_native:
+			# ANY money at this address makes it used for a wallet's purposes.
+			# Advancing only on `settled` left a part payment, a late one, or
+			# one under review looking like an unused address.
 			RECIPIENTS.paid(sale["index"])
 		RECIPIENTS.close(sale["id"])
 		return PollResult(decision.state, decision.credited_native, decision.sighted_native,
@@ -765,7 +795,8 @@ def _watch_loop():
 def _watch_one_pass(now):
 	"""One sweep over every open sale. Separated so it can be tested."""
 	for sale in SALES.open_sales():
-		if not SALES.lease(sale["id"], now):
+		token = SALES.lease(sale["id"], now)
+		if token is None:
 			continue                      # another worker owns this one
 		try:
 			# LOOK ONE MORE TIME BEFORE CALLING IT UNPAID. A payment that
@@ -774,7 +805,7 @@ def _watch_one_pass(now):
 			# away silently. And if this read fails, we do NOT know the
 			# sale was unpaid -- so the provider branch below leaves it
 			# open rather than expiring it on ignorance.
-			result = poll_once(sale)
+			result = poll_once(sale, token)
 			if result.state != "pending" or now < sale["expires_at"]:
 				continue
 			if result.conflict:
@@ -788,12 +819,12 @@ def _watch_one_pass(now):
 				# decide.
 				if now < sale["expires_at"] + MATURATION_GRACE_SECONDS:
 					continue
-				if SALES.review(sale["id"], result):
+				if SALES.review(sale["id"], result, token):
 					RECIPIENTS.close(sale["id"])
 				continue
 			# (see Recipients) The address is NOT recycled: the QR it issued
 			# is still payable by whoever kept it.
-			if SALES.expire(sale["id"], now):
+			if SALES.expire(sale["id"], now, token):
 				RECIPIENTS.close(sale["id"])
 		except RailProviderError as exc:
 			# A PROVIDER ERROR IS NOT A VERDICT -- and it is the only thing
@@ -802,7 +833,7 @@ def _watch_one_pass(now):
 			# into one nobody is told about.
 			print(f"  watch {sale['id']}: provider unavailable: {exc}")
 		finally:
-			SALES.release(sale["id"])
+			SALES.release(sale["id"], token)
 		# Anything that is not a provider error propagates to `watcher`,
 		# which stops the service. Retrying a deterministic fault forever
 		# turns a paid sale into one nobody is ever told about.

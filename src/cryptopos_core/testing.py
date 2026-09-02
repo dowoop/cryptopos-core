@@ -29,7 +29,7 @@ accident; importing it is an explicit act. It must never appear in a
 deployment's registry.
 """
 
-from .errors import RailProviderError
+from .errors import InvalidRailPlugin, RailProviderError
 from .plugin import (
 	ADDRESS_VALIDATION, OBSERVATION, PAYMENT_REQUEST, SETTLEMENT,
 	Asset, Network, ObservationBatch, PaymentRequest, Readiness,
@@ -145,6 +145,16 @@ class MemoryRail:
 		# host's expiry rule described something that never happened.
 		late = [t for t in observations.transfers
 		        if t.block_time_epoch is not None and t.block_time_epoch > intent.expires_at_epoch]
+		# UNKNOWN IS NOT TIMELY. A confirmed transfer with no arrival time used
+		# to be credited as though it had arrived in the window, so a payment
+		# made after expiry settled simply because the script did not say when
+		# it landed. Refuse to script one rather than fail open on it.
+		for transfer in observations.transfers:
+			if transfer.confirmed and transfer.block_time_epoch is None:
+				raise InvalidRailPlugin(
+					f"scripted transfer {transfer.transaction_id!r} is confirmed but carries no "
+					f"'at' -- expiry is judged on when money arrived, and treating an unknown "
+					f"arrival as timely is how a late payment settles")
 		usable = [t for t in observations.transfers
 		          if t.confirmations >= 1 and t not in late
 		          and t.transaction_id not in claimed_transaction_ids]
