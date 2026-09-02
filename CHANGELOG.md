@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Seventeen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-two defects. Nothing in the payment protocol
+Eighteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found ninety-four defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -328,6 +328,12 @@ and the checks that keep them honest.
   the payer twenty-one ETH in fees, the merchant receives their one wei, and
   the sale settles perfectly -- an enormous loss invisible to every check. The
   gas fields are refused; a wallet can estimate its own fee.
+* An eighteenth round found two, both in the checks rather than the payments:
+  a `raises` block could carry a `# ->` claim that nothing read, because the
+  marker inventory ran after the mode was dispatched; and a comment in the
+  example still described the pre-fix behaviour of an immature late transfer.
+  Markers are inventoried for every block before dispatch, and a `raises` block
+  carrying one is refused exactly as a `skip` block is.
 
 ## 2.1.1
 

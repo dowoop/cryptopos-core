@@ -823,18 +823,17 @@ def poll_once(sale, token):
 	decision = RAIL.settle(intent, batch,
 	                       claimed_transaction_ids=SALES.claimed_at(sale["recipient"]))
 
-	# WHAT MAKES AN ADDRESS "USED" IS THE RAIL'S OWN MATURITY RULE, not one
-	# confirmation. `confirmed` means only `confirmations > 0`, so a single
-	# shallow block moved the high-water mark permanently and a reorg could
-	# not move it back -- hiding a later payment behind a longer unused run
-	# than the counter believed. Money the rail was willing to CREDIT has
-	# passed whatever depth that rail requires; a terminal decision that saw
-	# money has too.
-	# ONLY CREDITED MONEY. "Terminal and sighted" looked equivalent and is not:
-	# a late transfer one block deep is terminal (`needs-review`) with money
-	# sighted and nothing credited, so a shallow confirmation persisted after
-	# all -- and a reorg cannot move the mark back. `credited_native` is the
-	# one unambiguous statement that the rail's own depth gate was passed.
+	# WHAT MAKES AN ADDRESS "USED" IS THE RAIL'S OWN MATURITY RULE, and
+	# `credited_native` is the one unambiguous statement that it was met.
+	#
+	# `confirmed` is not: it means only `confirmations > 0`, so a single
+	# shallow block moved the high-water mark permanently and no reorg could
+	# move it back, hiding a later payment behind a longer unused run than the
+	# counter believed. "Terminal and sighted" is not either -- money can be
+	# sighted, terminal and uncredited, and nothing in `SettlementDecision`
+	# promises otherwise, so a host that reads durability out of a terminal
+	# state is reading a convention rather than a guarantee.
+	#
 	# Being wrong in this direction only over-reports the unused run, which
 	# costs an early refusal rather than hidden money.
 	if decision.credited_native:
