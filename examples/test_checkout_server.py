@@ -941,6 +941,26 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app._check_payment_identity(Btc, Intent, address, f"bitcoin:{address}")
 
+	def test_an_integer_amount_with_underscores_is_refused(self):
+		"""`int("1_000")` is 1000 in Python and nothing in ERC-681 or BIP-21.
+		Only the grammar check stands between the two readings -- the digit
+		conversion happily accepts it."""
+		class Native:
+			key = "memory:testnet/native:tok"
+
+			class network:
+				namespace, reference, is_testnet = "memory", "testnet", True
+
+			class asset:
+				namespace, reference, decimals, symbol = "native", "tok", 2, "TOK"
+
+		class Intent:
+			amount_native = 1000
+
+		app._check_payment_identity(Native, Intent, "mem1a", "memory:mem1a?amount=1000")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(Native, Intent, "mem1a", "memory:mem1a?amount=1_000")
+
 	def test_an_amount_is_read_by_the_uri_grammar_not_pythons(self):
 		"""`int` and `Decimal` accept `1_000`, `1.25E-3` and full-width digits.
 		BIP-21 and ERC-681 accept none of those, and a wallet reading the same
@@ -960,7 +980,15 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		address = "tb1qp5wfcq48h6d63wyy9qz0awtpfqwwv4smhppgv3"
 		app._check_payment_identity(Btc, Intent, address,
 		                            f"bitcoin:{address}?amount=0.00125000")
-		for bad in ("1.25E-3", "0.001_250_00", "0.001250009", "0.0012500001", "\uff10.001"):
+		# Exactly the invoice, written with more zeros than it needs.
+		app._check_payment_identity(Btc, Intent, address,
+		                            f"bitcoin:{address}?amount=0.001250000000")
+		for bad in (
+			"1.25E-3", "0.001_250_00", "0.001250009", "0.0012500001", "\uff10.001",
+			# Beyond Decimal's default 28-digit context, where `scaleb` used to
+			# round the difference away and call it exactly the invoice.
+			"0.0012500000000000000000000000000000000009",
+		):
 			with self.assertRaises(ValueError):
 				app._check_payment_identity(Btc, Intent, address,
 				                            f"bitcoin:{address}?amount={bad}")

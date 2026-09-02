@@ -39,7 +39,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, parse_qsl, urlparse
 
@@ -678,14 +677,17 @@ def _check_amount(rail, uri, arguments, wanted):
 	if kind == "native":
 		asked = int(text)
 	else:
-		# EXACT, NEVER TRUNCATED. `int(Decimal("0.001250009") * 10**8)` is
-		# 125000 -- an amount that is not the invoice and not a whole number of
-		# atomic units -- and it used to be accepted as though it were both.
-		scaled = Decimal(text).scaleb(rail.asset.decimals)
-		if scaled != scaled.to_integral_value():
+		# DIGITS, NOT DECIMAL ARITHMETIC. Two versions of this were wrong.
+		# `int(Decimal(text) * 10**8)` truncated 0.001250009 to the invoice;
+		# `Decimal.scaleb` then rounded at the ACTIVE CONTEXT's 28 digits, so
+		# 0.0012500000000000000000000000000000000009 became exactly the invoice
+		# too. Neither is a fact about the payment. Shifting the point by hand
+		# depends on no context and rounds nothing.
+		whole, _, fraction = text.partition(".")
+		if fraction[rail.asset.decimals:].strip("0"):
 			raise ValueError(f"the payment URI's amount {text!r} is finer than one atomic "
 			                 f"unit of {rail.asset.symbol}")
-		asked = int(scaled)
+		asked = int(whole + fraction[:rail.asset.decimals].ljust(rail.asset.decimals, "0"))
 	if asked != wanted:
 		raise ValueError(f"the payment URI asks for {asked}, and the invoice is {wanted}")
 

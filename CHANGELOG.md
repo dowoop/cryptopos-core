@@ -3,7 +3,7 @@
 ## 2.2.0
 
 Nineteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-nine defects, after which the adversary
+and the gate over both found a hundred defects, after which the adversary
 reported convergence. What it could not close is published as a trust boundary
 in README.md rather than left implied. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
@@ -355,6 +355,12 @@ and the checks that keep them honest.
   `1_000` and full-width digits that no wallet reading BIP-21 or ERC-681 would.
   The text is matched against the scheme's own grammar, and the scaled decimal
   must be exactly integral before it is converted.
+* And the second version was wrong too, in a subtler way:
+  `Decimal.scaleb` rounds at the ACTIVE CONTEXT's precision, so
+  `0.0012500000000000000000000000000000000009` -- forty digits, past the
+  default twenty-eight -- became exactly the invoice. The conversion shifts the
+  decimal point by moving digits, which depends on no context and rounds
+  nothing, and refuses any non-zero digit finer than one atomic unit.
 
 ## 2.1.1
 
