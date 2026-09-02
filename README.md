@@ -324,8 +324,10 @@ parser for is refused rather than shown to a payer. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state
-file is valid JSON and rolls the allocator backwards; only an external identity
-for the allocator can catch that. And a payment that lands after a sale expired
+file is valid JSON and rolls the allocator backwards: the file carries a
+fingerprint of the key, rail and mode it belongs to, so a rotated key or a
+different chain cannot inherit its counters, but nothing distinguishes an old
+copy of its own from the current one. And a payment that lands after a sale expired
 is never misattributed — the address is not reused — but nothing here goes back
 to look for it, so late money needs wallet reconciliation you build separately.
 

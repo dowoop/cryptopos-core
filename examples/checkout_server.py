@@ -39,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from cryptopos_core import hd
 from cryptopos_core.conformance import require_conformant
@@ -301,6 +301,15 @@ class Recipients:
 
 	def __init__(self, rail, xpub, shared_recipient):
 		self._rail = rail
+		# WHOSE COUNTERS ARE THESE? The file records how far one allocator has
+		# gone. Rotating the xpub, or pointing the same directory at another
+		# rail, used to inherit those numbers: the new account has no history
+		# at all, and the old `highest_paid` told the guard its unused run was
+		# short when it was the whole range. A fingerprint of the key, the rail
+		# and the mode makes that a refusal.
+		self._identity = hashlib.sha256(
+			f"{xpub or ''}|{rail.key}|{'derived' if xpub else 'shared:' + shared_recipient}"
+			.encode()).hexdigest()[:16]
 		self._account = hd.parse_extended_key(xpub) if xpub else None
 		if self._account is not None and self._account.depth == 0:
 			# A MASTER KEY IS NOT AN ACCOUNT KEY. Deriving `0/index` from it
@@ -343,8 +352,7 @@ class Recipients:
 					f"no address derivation is defined for the '{namespace}' namespace. "
 					f"Deriving one anyway would produce an address you hold no key for.")
 
-	@staticmethod
-	def _read_state():
+	def _read_state(self):
 		"""The next free index, or a refusal.
 
 		ABSENT means first run and zero is genuine. UNREADABLE does not: a
@@ -363,7 +371,8 @@ class Recipients:
 					f"{STATE_FILE} does not exist. If this really is a new deployment, start "
 					f"once with CRYPTOPOS_INIT=1 to create it. If it is not, find the file: "
 					f"allocating from zero would re-issue live receiving addresses.")
-			return {"next_index": 0, "static_used": False, "highest_paid": -1}
+			return {"next_index": 0, "static_used": False, "highest_paid": -1,
+			        "identity": self._identity}
 		try:
 			stored = json.loads(STATE_FILE.read_text())
 			index, used = stored["next_index"], stored["static_used"]
@@ -371,6 +380,11 @@ class Recipients:
 			# nothing about which of its indices were used, and reading that
 			# silence as "none unused" permits exactly the over-allocation the
 			# field exists to stop. Refuse and let an operator supply it.
+			if stored.get("identity") != self._identity:
+				raise ValueError(
+					f"these counters belong to allocator {stored.get('identity')!r}, and this "
+					f"one is {self._identity!r} -- a different key, rail, or mode. Its indices "
+					f"say nothing about this one's unused run; use a separate CRYPTOPOS_STATE")
 			if "highest_paid" not in stored:
 				raise ValueError("no 'highest_paid' recorded. An older state file cannot say "
 				                 "how long its run of unused addresses is; set it by hand "
@@ -384,15 +398,15 @@ class Recipients:
 				raise ValueError("next_index must be a non-negative JSON integer, "
 				                 "static_used a JSON boolean, and highest_paid an integer "
 				                 "from -1 up to next_index - 1")
-			return {"next_index": index, "static_used": used, "highest_paid": paid}
+			return {"next_index": index, "static_used": used, "highest_paid": paid,
+			        "identity": self._identity}
 		except Exception as exc:
 			raise SystemExit(
 				f"{STATE_FILE} is unreadable ({exc}). Refusing to allocate: assuming zero "
 				f"would re-issue receiving addresses that may already be live.") from None
 
-	@classmethod
-	def _read_counter(cls):
-		return cls._read_state()["next_index"]
+	def _read_counter(self):
+		return self._read_state()["next_index"]
 
 	def _save(self, state):
 		"""Replace the stored state atomically and durably.
@@ -410,7 +424,8 @@ class Recipients:
 			# reissue address zero.
 			handle.write(json.dumps({"next_index": state["next_index"],
 			                         "static_used": state["static_used"],
-			                         "highest_paid": state["highest_paid"]}))
+			                         "highest_paid": state["highest_paid"],
+			                         "identity": self._identity}))
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, STATE_FILE)
@@ -630,6 +645,11 @@ def _check_payment_identity(rail, intent, through, uri):
 		raise ValueError(f"the payment URI uses the {scheme!r} scheme, not "
 		                 f"{URI_SCHEMES[namespace]!r}")
 	target = rest.split("@", 1)[0].split("?", 1)[0].split("/", 1)[0]
+	# ORDERED. An ERC-681 contract call is identified by its argument TYPES in
+	# order, not by a bag of names: `?uint256=1&address=M&bytes32=..` describes
+	# a different ABI call from `transfer(address,uint256)`, and `parse_qs`
+	# cannot tell them apart because it throws the order away.
+	arguments = parse_qsl(urlparse(uri).query, keep_blank_values=True)
 	query = parse_qs(urlparse(uri).query)
 
 	if namespace in ("ethereum", "polygon"):
@@ -653,13 +673,15 @@ def _check_payment_identity(rail, intent, through, uri):
 			if function != "transfer":
 				raise ValueError(f"the payment URI calls {function or 'no function'!r}, "
 				                 f"not 'transfer'")
-			addresses = query.get("address") or []
-			# EXACTLY ONE. Several `address=` parameters leave the payee to
-			# whichever the wallet happens to read first.
-			if len(addresses) != 1:
-				raise ValueError(f"the payment URI carries {len(addresses)} `address` "
-				                 f"parameters; exactly one names the payee")
-			paid = addresses[0]
+			# `transfer(address,uint256)` and nothing else. Several `address=`
+			# parameters would leave the payee to whichever the wallet read
+			# first; an extra typed argument, or these two in the other order,
+			# is a different call.
+			names = [name for name, _value in arguments]
+			if names != ["address", "uint256"]:
+				raise ValueError(f"the payment URI's arguments are {names}, not "
+				                 f"['address', 'uint256'] -- that is a different ABI call")
+			paid = arguments[0][1]
 		else:
 			if function:
 				raise ValueError(f"a native EVM payment URI must call no function, not "

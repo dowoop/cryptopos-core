@@ -10,6 +10,7 @@ copied it.
 
 import contextlib
 import io
+import json
 import os
 import pathlib
 import sys
@@ -354,7 +355,9 @@ class TheGapLimitIsDefended(Harness):
 	def test_an_old_state_file_without_the_field_is_refused(self):
 		"""It cannot say how long its run of unused addresses is, and reading
 		that silence as zero permits the over-allocation the field prevents."""
-		app.STATE_FILE.write_text('{"next_index": 100, "static_used": false}')
+		identity = app.Recipients(app.RAIL, app.DEMO_XPUB, "")._identity
+		app.STATE_FILE.write_text(json.dumps(
+			{"next_index": 100, "static_used": False, "identity": identity}))
 		with self.assertRaises(SystemExit) as refused:
 			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
 		# Naming the field is not enough -- a bare KeyError does that. The
@@ -658,26 +661,40 @@ class KeysAndStateAreChecked(Harness):
 
 	def test_coerced_state_is_refused(self):
 		"""int("12") succeeds and means something the file did not say."""
-		app.STATE_FILE.write_text(
-			'{"next_index": "12", "static_used": false, "highest_paid": -1}')
+		identity = app.Recipients(app.RAIL, app.DEMO_XPUB, "")._identity
+		app.STATE_FILE.write_text(json.dumps(
+			{"next_index": "12", "static_used": False, "highest_paid": -1,
+			 "identity": identity}))
 		with self.assertRaises(SystemExit) as refused:
 			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
 		self.assertIn("non-negative JSON integer", str(refused.exception))
 
-	def test_a_static_allocator_cannot_roll_the_counter_backwards(self):
-		"""It re-read only its own flag and wrote a cached index, reissuing
-		address zero over a derived allocator's live addresses."""
-		class Static:
+	def test_another_allocators_counters_are_refused(self):
+		"""The file records how far ONE allocator has gone. Rotating the key,
+		or pointing the same directory at another rail, used to inherit those
+		numbers -- and the new account has no history at all, so an old
+		`highest_paid` told the guard its unused run was short when it was the
+		whole range."""
+		app.start_sale(100)                       # writes this allocator's state
+		other = ("xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWM"
+		         "iGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ")
+		with self.assertRaises(SystemExit) as refused:
+			app.Recipients(app.RAIL, other, "")
+		self.assertIn("belong to allocator", str(refused.exception))
+
+	def test_a_different_rail_does_not_inherit_the_counters(self):
+		"""A Bitcoin payment must not reset the gap counter an EVM deployment
+		later reads; its address history is empty."""
+		app.start_sale(100)
+
+		class OtherRail:
 			key = "bitcoin:testnet4/native:btc"
 
 			class network:
-				namespace, is_testnet = "bitcoin", True
+				namespace, reference, is_testnet = "bitcoin", "testnet4", True
 
-		static = app.Recipients(Static, None, "mem1static")
-		derived = app.Recipients(app.RAIL, app.DEMO_XPUB, "")
-		first = derived.allocate("a")[0]
-		static.allocate("b")
-		self.assertGreater(derived.allocate("c")[0], first)
+		with self.assertRaises(SystemExit):
+			app.Recipients(OtherRail, app.DEMO_XPUB, "")
 
 
 class NoSaleIsHandedOutUnwatched(Harness):
@@ -880,6 +897,22 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 			app._check_payment_identity(
 				Sepolia, None, merchant,
 				f"ethereum:{merchant}@11155111/drain?value=1")
+
+	def test_an_erc20_uri_with_a_different_abi_signature_is_refused(self):
+		"""An ERC-681 call is identified by its argument TYPES in order.
+		`?uint256=1&address=M&bytes32=..` describes a different call, and a
+		wallet encodes a different selector for it."""
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+		contract = self._usdc().asset.reference
+		good = f"ethereum:{contract}@80002/transfer?address={merchant}&uint256=1"
+		app._check_payment_identity(self._usdc(), None, merchant, good)
+		for bad in (
+			f"ethereum:{contract}@80002/transfer?uint256=1&address={merchant}",
+			f"ethereum:{contract}@80002/transfer?address={merchant}&uint256=1&bytes32=de",
+			f"ethereum:{contract}@80002/transfer?address={merchant}",
+		):
+			with self.assertRaises(ValueError):
+				app._check_payment_identity(self._usdc(), None, merchant, bad)
 
 	def test_an_erc20_uri_with_two_payees_is_refused(self):
 		"""Which one the wallet reads is not the host's decision to leave open."""

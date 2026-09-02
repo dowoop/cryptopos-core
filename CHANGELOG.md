@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Thirteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found eighty-seven defects. Nothing in the payment protocol
+Fourteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found eighty-nine defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -296,6 +296,17 @@ and the checks that keep them honest.
     `credited_native`, and `MemoryRail` now judges lateness on transfers that
     passed its depth gate, so immature money stays pending rather than
     resolving early.
+* A fourteenth round found two more:
+  - **The allocator's counters were not bound to the allocator.** Rotating
+    `CRYPTOPOS_XPUB`, or pointing the same state file at another rail,
+    inherited the old account's `highest_paid` -- and the new account has no
+    history at any index, so the guard was told its unused run was short when
+    it was the entire range. The file carries a fingerprint of the key, rail
+    and mode now, and a mismatch is refused.
+  - An ERC-681 call is identified by its argument TYPES in order, and
+    `parse_qs` threw the order away. `?uint256=1&address=M&bytes32=..` passed
+    while describing a different ABI call. The arguments must be exactly
+    `address` then `uint256`.
 
 ## 2.1.1
 
