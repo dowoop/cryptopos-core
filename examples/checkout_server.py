@@ -640,15 +640,30 @@ def _check_payment_identity(rail, intent, through, uri):
 		if named_chain != wanted_chain:
 			raise ValueError(f"the payment URI names chain {named_chain or 'none'}, "
 			                 f"not {wanted_chain}")
+		# The FUNCTION, exactly. `"/transfer" not in path` accepted
+		# `/transferFrom` and `/transferAnything`: an ERC-681 path names the
+		# contract call a wallet makes, and a prefix match names a different one.
+		path = urlparse(uri).path
+		function = path.split("/", 1)[1] if "/" in path else ""
 		if rail.asset.namespace == "erc20":
 			# The URI targets the CONTRACT and carries the payee as a parameter.
 			if target.lower() != rail.asset.reference.lower():
 				raise ValueError(f"the payment URI calls contract {target!r}, "
 				                 f"not {rail.asset.reference!r}")
-			if "/transfer" not in rest.split("?", 1)[0]:
-				raise ValueError("the payment URI does not call `transfer`")
-			paid = (query.get("address") or [""])[0]
+			if function != "transfer":
+				raise ValueError(f"the payment URI calls {function or 'no function'!r}, "
+				                 f"not 'transfer'")
+			addresses = query.get("address") or []
+			# EXACTLY ONE. Several `address=` parameters leave the payee to
+			# whichever the wallet happens to read first.
+			if len(addresses) != 1:
+				raise ValueError(f"the payment URI carries {len(addresses)} `address` "
+				                 f"parameters; exactly one names the payee")
+			paid = addresses[0]
 		else:
+			if function:
+				raise ValueError(f"a native EVM payment URI must call no function, not "
+				                 f"{function!r}")
 			if query.get("address"):
 				raise ValueError("a native EVM payment URI must not carry an `address` parameter")
 			paid = target
@@ -764,7 +779,14 @@ def poll_once(sale, token):
 	# than the counter believed. Money the rail was willing to CREDIT has
 	# passed whatever depth that rail requires; a terminal decision that saw
 	# money has too.
-	if decision.credited_native or (decision.state != "pending" and decision.sighted_native):
+	# ONLY CREDITED MONEY. "Terminal and sighted" looked equivalent and is not:
+	# a late transfer one block deep is terminal (`needs-review`) with money
+	# sighted and nothing credited, so a shallow confirmation persisted after
+	# all -- and a reorg cannot move the mark back. `credited_native` is the
+	# one unambiguous statement that the rail's own depth gate was passed.
+	# Being wrong in this direction only over-reports the unused run, which
+	# costs an early refusal rather than hidden money.
+	if decision.credited_native:
 		RECIPIENTS.paid(sale["index"])
 	if decision.state == "pending":
 		# CARRY WHAT THE RAIL SAID. Overwriting `credited_native` with zero

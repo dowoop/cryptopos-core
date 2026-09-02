@@ -261,6 +261,42 @@ class TheGapLimitIsDefended(Harness):
 			app.poll_once(app.SALES.get(mine["id"]), token)
 		self.assertEqual(app.RECIPIENTS._read_state()["highest_paid"], before)
 
+	def test_a_LATE_shallow_confirmation_does_not_mark_the_address_used(self):
+		"""A late transfer one block deep is terminal with money sighted and
+		none credited, so "terminal and sighted" persisted exactly the shallow
+		confirmation the depth rule exists to exclude."""
+		app.RAIL.min_confirmations = 3
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 2
+		try:
+			first = app.start_sale(100)
+			app.CONFIG["tip"] = 100
+			app.CONFIG["transfers"].append({
+				"id": "late-and-shallow", "to": first["recipient"], "amount": 100,
+				"confs": 1, "height": 71, "at": first["expires_at"] + 1})
+			self.poll(first)
+			self.assertEqual(app.RECIPIENTS._read_state()["highest_paid"], -1)
+			app.start_sale(1)
+			with self.assertRaises(ValueError):
+				app.start_sale(1)
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
+	def test_only_credited_money_marks_the_address_used(self):
+		"""A late transfer deep enough to be terminal still credits nothing,
+		and `credited_native` is the one unambiguous statement that the rail's
+		own depth gate was passed. Being conservative here costs an early
+		refusal; being generous hides money behind a longer run than the
+		counter believes."""
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 2
+		try:
+			first = app.start_sale(100)
+			self.pay(first, 100, 71, "late-but-deep", at=first["expires_at"] + 1)
+			result = self.poll(first)
+			self.assertEqual((result.state, result.credited_native), ("needs-review", 0))
+			self.assertEqual(app.RECIPIENTS._read_state()["highest_paid"], -1)
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
 	def test_a_shallow_confirmation_does_not_mark_the_address_used(self):
 		"""`confirmed` means only `confirmations > 0`. One shallow block moved
 		the durable high-water mark permanently, and a reorg could not move it
@@ -812,6 +848,59 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app._check_payment_identity(Sepolia, None, merchant,
 			                            f"ethereum:{merchant}@1?value=1")
+
+	def test_an_erc20_uri_calling_a_different_function_is_refused(self):
+		"""`"/transfer" not in path` accepts `/transferFrom`. An ERC-681 path
+		names the contract call the wallet makes."""
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+		for function in ("transferFrom", "transferAnything", ""):
+			with self.assertRaises(ValueError):
+				app._check_payment_identity(
+					self._usdc(), None, merchant,
+					f"ethereum:{self._usdc().asset.reference}@80002/{function}"
+					f"?address={merchant}&uint256=1")
+
+	def test_a_native_evm_uri_calling_a_function_is_refused(self):
+		"""A native send calls nothing. A URI that pays the merchant AND names
+		a function is instructing something the host never checked."""
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+
+		class Sepolia:
+			key = "ethereum:sepolia/native:eth"
+
+			class network:
+				namespace, reference, is_testnet = "ethereum", "sepolia", True
+
+			class asset:
+				namespace, reference = "native", "eth"
+
+		app._check_payment_identity(Sepolia, None, merchant,
+		                            f"ethereum:{merchant}@11155111?value=1")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				Sepolia, None, merchant,
+				f"ethereum:{merchant}@11155111/drain?value=1")
+
+	def test_an_erc20_uri_with_two_payees_is_refused(self):
+		"""Which one the wallet reads is not the host's decision to leave open."""
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				self._usdc(), None, merchant,
+				f"ethereum:{self._usdc().asset.reference}@80002/transfer"
+				f"?address={merchant}&address=0xdead&uint256=1")
+
+	def _usdc(self):
+		class Usdc:
+			key = "polygon:amoy/erc20:0x41e9"
+
+			class network:
+				namespace, reference, is_testnet = "polygon", "amoy", True
+
+			class asset:
+				namespace, reference = "erc20", "0x41e94eb019c0762f9bfcf9fb1e58725bfb0e7582"
+
+		return Usdc
 
 	def test_an_erc20_uri_calling_another_contract_is_refused(self):
 		class Usdc:

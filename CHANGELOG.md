@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Twelve rounds of adversarial review of the cookbook, the reference example
-and the gate over both found eighty-five defects. Nothing in the payment protocol
+Thirteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found eighty-seven defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -283,6 +283,19 @@ and the checks that keep them honest.
     `min_confirmations` so a host can model a three-confirmation rail and test
     exactly that state. The `paid()` call also moved below `settle`, so a
     rejected batch can no longer leave a durable checkpoint behind.
+* A thirteenth round found two more:
+  - `"/transfer" not in path` accepted `/transferFrom` and `/transferAnything`.
+    An ERC-681 path names the contract call a wallet makes, and a prefix match
+    names a different one. The function is compared exactly, a native URI must
+    call none, and exactly one `address` parameter may name the payee -- two
+    left the choice to whichever the wallet read first.
+  - "Terminal and sighted" was not the same as "the rail credited it". A late
+    transfer one block deep returned terminal `needs-review` with money sighted
+    and nothing credited, so the shallow confirmation the depth rule exists to
+    exclude persisted after all. The allocator advances only on
+    `credited_native`, and `MemoryRail` now judges lateness on transfers that
+    passed its depth gate, so immature money stays pending rather than
+    resolving early.
 
 ## 2.1.1
 

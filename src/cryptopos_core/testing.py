@@ -147,7 +147,13 @@ class MemoryRail:
 		# Without a block time the double could not tell a timely payment from
 		# a late one, so a sale whose deadline had passed settled anyway and a
 		# host's expiry rule described something that never happened.
-		late = [t for t in observations.transfers
+		# LATENESS IS JUDGED ON TRANSFERS THAT PASSED THE DEPTH GATE. A late
+		# transfer one block deep used to return terminal `needs-review` with
+		# money sighted, which let a host treat a shallow confirmation as a
+		# durable fact. Until it is deep enough, the honest answer is that
+		# nothing has been established yet.
+		deep = [t for t in observations.transfers if t.confirmations >= max(1, int(self.min_confirmations))]
+		late = [t for t in deep
 		        if t.block_time_epoch is not None and t.block_time_epoch > intent.expires_at_epoch]
 		# UNKNOWN IS NOT TIMELY. A confirmed transfer with no arrival time used
 		# to be credited as though it had arrived in the window, so a payment
@@ -163,9 +169,8 @@ class MemoryRail:
 		# configuration lets a host model Sepolia's three or Bitcoin's one, and
 		# therefore the state that matters most: money confirmed on the chain
 		# and not yet deep enough for the rail to credit it.
-		depth = max(1, int(self.min_confirmations))
-		usable = [t for t in observations.transfers
-		          if t.confirmations >= depth and t not in late
+		usable = [t for t in deep
+		          if t not in late
 		          and t.transaction_id not in claimed_transaction_ids]
 		credited = sum(t.amount_native for t in usable)
 		if observations.unresolved_transaction_ids:
