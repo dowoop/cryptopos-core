@@ -1,5 +1,100 @@
 # Changelog
 
+## 2.2.0
+
+Four rounds of adversarial review of the cookbook, the reference example and
+the gate over both found thirty-one defects. Nothing in the payment protocol
+changed; everything below is the library's testing surface, its documentation,
+and the checks that keep them honest.
+
+* Added `cryptopos_core.testing.MemoryRail`, a full `PaymentRail` backed by a
+  dictionary instead of a provider, so a host can exercise double-credit,
+  partial-read, misattribution and `needs-review` paths with no network and no
+  funds. It ships in the wheel: the previous copy lived in `examples/`, which
+  meant the README's first recipe could not be run by anyone who had installed
+  the package rather than cloned it.
+* `MemoryRail.readiness()` now refuses a configuration it cannot actually be
+  driven with. It previously reported `chargeable=True` for `page=0`, where the
+  observation loop every recipe prescribes can never terminate, and for a
+  configuration with no `tip`, where `capture_baseline` then raised `KeyError`.
+  A double that lies about readiness teaches the opposite of what readiness
+  means.
+* `MemoryRail.observe()` can report a transfer whose status could not be
+  established, as an unconfirmed observation plus an unresolved id. The
+  `needs-review` outcome had no way to be demonstrated before, so the README
+  described it beside an example that produced `pending`.
+* `tools/readme.py` no longer puts `examples/` on the path for a `--wheel` run,
+  and takes `site-packages` off `sys.path` for it. That run now imports what
+  the wheel contains and what the standard library provides, which is what it
+  claimed to be checking.
+* `tools/readme.py` inventories `# ->` markers with the TOKENIZER and fails on
+  any that nothing checked. The previous line-regex missed a marker written
+  above its statement, one nested inside a function, and one with nothing after
+  the arrow — and fired on the characters appearing inside a string literal.
+* The stale-wheel guard compares the wheel's module bytes against `src/`,
+  refuses modules present in the wheel but deleted from `src/`, and compares
+  the wheel's `Requires-Dist` and `Requires-Python` against `pyproject.toml`.
+  A wheel whose metadata installs a dependency this tree no longer declares is
+  no less stale for having identical source.
+* Corrected the reference section that said core drives no rails, which stopped
+  being true when a conformant `MemoryRail` moved into the package, and the
+  recipe that called an elided skeleton "the whole of" that module.
+* `examples/checkout_server.py`: a third adversarial round found eight more
+  money-critical defects in the example itself, all fixed, each with a test
+  that fails when the guard is removed (11 of 11 mutants killed).
+  - Expiry read the clock and never the chain, so a payment confirming between
+    the last poll and the deadline was recorded as "nothing received". The
+    sweep now observes one final time and expires only on a complete read that
+    found nothing; a failed read leaves the sale open, because a provider that
+    will not answer is not evidence of non-payment.
+  - The allocation counter was written non-atomically and read fail-open, so a
+    crash mid-write handed the next sale index 0 again. It is now written
+    through a temporary with `fsync` and an atomic rename, and unreadable state
+    stops the shop rather than guessing zero.
+  - Two processes each loaded the counter at start-up and each handed out the
+    same index behind their own `threading.Lock`. Allocation re-reads the
+    counter inside an interprocess file lock.
+  - A shared recipient allowed one sale AT A TIME, which is not safe: the
+    finished sale's QR is still payable and settles whoever holds the address
+    next. It now allows one sale for the address's entire lifetime.
+  - The index was allocated before the amount was validated, so refused
+    requests silently consumed addresses toward the wallet's gap limit.
+  - Watcher health was set only around the poll, so a failure anywhere else in
+    the loop killed the thread while the server kept selling. The whole loop is
+    supervised and its death stops the service.
+  - A late worker was handed a fabricated `sighted_native` copied from
+    `credited_native`, erasing the evidence a `needs-review` sale exists to
+    show. The stored outcome is its own type carrying what was really seen.
+* Both rail READMEs previously suggested returning a spent derivation index to
+  a pool after a cooldown, to spare the wallet's gap limit. That is unsafe for
+  the same reason: no finite cooldown makes an old payment request unpayable.
+  They now say an index is spent the moment it is shown, and treat the gap
+  limit as a constraint to plan for rather than to recycle around.
+* A fourth round found five more, all fixed:
+  - `MemoryRail.readiness()` collected every configuration problem into one
+    string and attached it to all four capabilities, so it reported address
+    validation unavailable "because there is no endpoint configured" while
+    `validate_recipient` worked fine without one. Reasons now name only the
+    capabilities they actually block.
+  - The example's "one sale ever" for a shared recipient lived in memory, so a
+    restart or a second process handed the same address to another customer.
+    It is persisted with the allocation counter, read under the interprocess
+    lock, and can only ever go from unused to used.
+  - `tools/readme.py` read `# ->` claims out of COMMENT TOKENS instead of raw
+    lines. The line regex read `"# -> not a comment"` inside a string as a
+    claim, and let `1  # -> 1  # -> 2` pass by checking only the text after the
+    last arrow. A comment carrying two arrows is now refused outright.
+  - Claims are compared by type as well as value: `1  # -> True` and
+    `1  # -> 1.0` both used to pass on Python equality while showing a reader
+    a representation the code does not produce.
+  - The wheel check compares `entry_points.txt` against pyproject, and the
+    wheel's `Name` and `Version` against it — a wheel with a stale or missing
+    entry point installs cleanly, matches every module byte, and provides no
+    rail at all. `--wheel` also builds its `sys.path` from the standard library
+    rather than filtering `site-packages` out of the existing one, which had
+    left `PYTHONPATH` entries and editable installs reachable. Missing
+    `tomllib` now refuses the run instead of silently skipping the comparison.
+
 ## 2.1.1
 
 Documentation and packaging only; no behaviour changed.

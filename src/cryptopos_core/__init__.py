@@ -35,6 +35,11 @@ package found through the `cryptopos.rails` entry-point group:
 The chain reader moved to `cryptopos-rail-ootle` in 2.0 and is imported from
 `cryptopos_rail_ootle.chain`. README.md is the cookbook; `tools/readme.py`
 checks every example in it against the built wheel.
+
+`cryptopos_core.testing` holds a scripted rail for testing a host with no
+chain. It is not imported here: a deployment should not carry a test double in
+its runtime namespace, and `from cryptopos_core.testing import MemoryRail` is
+the one line a test needs.
 """
 
 from . import (
@@ -74,7 +79,7 @@ from .modes import VALID_MODES
 from .rails import RAILS, rail_for, rail_keys
 from .uri import build_uri
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 __all__ = [
 	"RAILS",

@@ -4,44 +4,81 @@
 	python3 checkout_server.py                 # scripted rail, no chain, no funds
 	CRYPTOPOS_RAIL=bitcoin:testnet4/native:btc \
 	CRYPTOPOS_ENDPOINT=https://mempool.space/testnet4/api \
-	CRYPTOPOS_RECIPIENT=tb1q... python3 checkout_server.py
+	CRYPTOPOS_XPUB=tpub... python3 checkout_server.py
 
 Nothing here is Flask-, Django-, or FastAPI-specific: the only framework
 contact points are "read a request" and "write a response". Everything between
 them is the five-call rail protocol, and it is the same five calls in any host.
 
-The four things a host must get right are marked (1)-(4) below. They are the
-four this project has actually got wrong, with real money, at least once.
+The five obligations marked (1)-(5) below are the ones in README.md, in the
+same order. Each has cost this project real money at least once, and each has a
+test in `test_checkout_server.py` that fails if the guard is removed.
+
+WHAT THIS EXAMPLE IS NOT. It has no authentication, no operator workflow, and
+no durable store beyond one small file for the derivation high-water mark. The
+review page is a demonstration that `needs-review` needs somewhere to go, not a
+back office. Copy the payment logic; build the rest for your own deployment.
 """
 
+import contextlib
+import fcntl
+import hashlib
+import html
 import json
 import os
+import pathlib
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from cryptopos_core import hd
 from cryptopos_core.conformance import require_conformant
+from cryptopos_core.errors import RailProviderError
 from cryptopos_core.plugin import PaymentIntent
-from cryptopos_core.qr import modules_for
 from cryptopos_core.registry import RailRegistry
 
 WINDOW_SECONDS = 15 * 60
 POLL_SECONDS = 5
+STATE_FILE = pathlib.Path(os.environ.get("CRYPTOPOS_STATE", ".checkout-state.json"))
+
+CLAIMED, CONFLICT, ALREADY_DECIDED = "claimed", "conflict", "already-decided"
+
+
+class Unhealthy(Exception):
+	"""The watcher died. New sales must stop; money must not be taken blind."""
+
+
+HEALTH = {"watching": True, "why": ""}
 
 
 # --------------------------------------------------------------------------
 # Storage. This is the part you replace with your database.
 # --------------------------------------------------------------------------
 class Sales:
-	"""Sales, plus the set of transaction ids already spent on one.
+	"""Sales, plus the transaction ids already spent on one.
 
-	(1) THE CREDITED IDS AND THE SALE STATE MUST MOVE TOGETHER. `settle` is
-	pure -- it will happily credit the same transfer to a second sale unless
-	you tell it what is already spent. Persist `decision.transaction_ids` in
-	the SAME transaction that writes the settled state, or a crash between the
-	two writes pays an invoice twice.
+	(2) A CREDITED TRANSACTION ID MUST BE CLAIMED EXCLUSIVELY, AND THE CLAIM
+	MUST BE PART OF THE SAME WRITE AS THE SALE STATE. `settle` is pure: it
+	credits whatever you did not tell it was already spent. Reading the claimed
+	set, settling, then writing looks safe and is not -- two workers read the
+	same set before either writes, and one transfer settles two invoices.
+
+	A lock around the READ does not fix it; the gap is between read and write.
+	What fixes it is that claiming an id can FAIL. Here that is a check inside
+	the lock; in your database it is
+
+	    CREATE TABLE credited_tx (tx_id TEXT PRIMARY KEY, sale_id TEXT NOT NULL)
+
+	and the INSERT that loses the race raises, rolling back the sale state with
+	it. The constraint is the thing that saves you, not the lock.
+
+	The state transition is ALSO conditional. A worker that arrives late holds
+	a decision computed from a stale snapshot -- typically `needs-review`,
+	which carries no transaction ids at all, so the uniqueness constraint
+	cannot catch it. Only `WHERE state = 'pending'` can.
 	"""
 
 	def __init__(self):
@@ -62,63 +99,303 @@ class Sales:
 		with self._lock:
 			return [dict(s) for s in self._sales.values() if s["state"] == "pending"]
 
+	def in_review(self):
+		"""Sales a person must decide. `needs-review` is not a status string:
+		it is a queue, and money is sitting in it."""
+		with self._lock:
+			return [dict(s) for s in self._sales.values() if s["state"] == "needs-review"]
+
 	def claimed(self):
 		with self._lock:
 			return frozenset(self._credited)
 
 	def record(self, sale_id, decision):
+		"""Claim the transactions and write the state, or do neither.
+
+		Returns CLAIMED, CONFLICT (another sale owns one of these ids), or
+		ALREADY_DECIDED (this sale is no longer pending). The caller needs the
+		difference: a conflict may resolve on the next poll, whereas an already
+		decided sale has no next poll and its stored state is the true answer.
+		"""
 		with self._lock:
 			sale = self._sales[sale_id]
+			if sale["state"] != "pending":
+				return ALREADY_DECIDED
+			if self._credited.intersection(decision.transaction_ids):
+				return CONFLICT
 			sale["state"] = decision.state
 			sale["reason"] = decision.reason
 			sale["credited_native"] = decision.credited_native
+			sale["sighted_native"] = decision.sighted_native
 			sale["transaction_ids"] = list(decision.transaction_ids)
-			self._credited.update(decision.transaction_ids)   # atomic with the line above
+			self._credited.update(decision.transaction_ids)   # claimed with the write
+			return CLAIMED
+
+	def expire(self, sale_id, now):
+		"""Stop watching a sale whose window closed with nothing in it."""
+		with self._lock:
+			sale = self._sales[sale_id]
+			if sale["state"] != "pending" or now < sale["expires_at"]:
+				return False
+			sale["state"] = "expired"
+			sale["reason"] = "the payment window closed with nothing received"
+			return True
 
 
 SALES = Sales()
 
 
 # --------------------------------------------------------------------------
-# The rail. One registry, built once, at start-up.
+# Where each sale is paid.
 # --------------------------------------------------------------------------
+#: How to turn a derived key into an address, per network namespace. A rail
+#: whose namespace is absent gets a REFUSAL, never a guess: deriving an EVM
+#: address for an unknown chain produces something syntactically plausible
+#: that the merchant holds no key for, which is the most expensive possible
+#: way to be wrong.
+DERIVATIONS = {
+	"bitcoin": lambda key, testnet: hd.p2wpkh_address(key, "tb" if testnet else "bc"),
+	"ethereum": lambda key, testnet: hd.evm_address(key),
+	"polygon": lambda key, testnet: hd.evm_address(key),
+	# The scripted rail's address space, so the demo exercises the same
+	# per-sale derivation path as a real chain rather than a special case.
+	"memory": lambda key, testnet: "mem1" + hashlib.sha256(key.public_key).hexdigest()[:16],
+}
+
+
+class Recipients:
+	"""One address per sale, allocated once and NEVER reused.
+
+	(1) TWO SALES MUST NOT SHARE A RECEIVING ADDRESS -- and "share" includes
+	one after the other. A rail whose `binding_category` is
+	`not-unconditional` credits every unclaimed, timely transfer it sees, so
+	two OPEN sales at one address settle each other's money with no race at
+	all. Reproduced here: a sale invoiced 100 settled on 350.
+
+	Sequential reuse is no safer, and this is the part that is easy to get
+	wrong. A payment instruction cannot be withdrawn. A customer who kept the
+	QR from a finished sale can pay it tomorrow; if that address now belongs to
+	a new sale, the transfer arrives after the new baseline, inside the new
+	window, and settles the wrong invoice. Also reproduced here. So an index is
+	spent forever the moment it is shown to anybody -- there is no cooldown
+	long enough, because no finite time makes an old QR unpayable.
+
+	THAT COSTS YOU GAP LIMIT, AND YOU PAY IT DELIBERATELY. A wallet restoring
+	from the seed scans forward only until it meets a run of unused addresses,
+	commonly 20 (BIP-44). Never reusing means abandoned checkouts burn indices,
+	so a busy shop must keep the watching wallet's gap limit above its
+	unpaid-sale run length, and must keep `_next` DURABLE -- which is why it is
+	written to a file here. Losing it restarts allocation at zero and hands a
+	live address to a second sale, which is failure (1) again by another route.
+	Backpressure is the honest remedy if you cannot raise the gap limit; reuse
+	is not.
+	"""
+
+	def __init__(self, rail, xpub, shared_recipient):
+		self._rail = rail
+		self._account = hd.parse_extended_key(xpub) if xpub else None
+		self._shared = shared_recipient
+		self._lock = threading.Lock()
+		self._open = {}
+		stored = self._read_state()
+		# PERSISTED, like the index. "One sale ever" that forgets on restart is
+		# "one sale per process", and the second process hands the same address
+		# to a second customer while the first one's QR is still payable.
+		#
+		# Reading it here is defensive rather than load-bearing: `allocate`
+		# re-reads it under the interprocess lock, which is what actually makes
+		# the refusal correct when two processes race. Changing this line alone
+		# therefore breaks no test, and that is expected rather than a gap.
+		self._static_spent = stored["static_used"]
+		self._next = stored["next_index"]
+		if self._account is not None:
+			namespace = rail.network.namespace
+			if namespace not in DERIVATIONS:
+				raise SystemExit(
+					f"no address derivation is defined for the '{namespace}' namespace. "
+					f"Deriving one anyway would produce an address you hold no key for.")
+
+	@staticmethod
+	def _read_state():
+		"""The next free index, or a refusal.
+
+		ABSENT means first run and zero is genuine. UNREADABLE does not: a
+		truncated write, a stale backup or a wrong schema would all hand out
+		index 0 again, re-issuing addresses that are already live. Failing open
+		here is the reuse failure with extra steps, so this stops instead.
+		"""
+		if not STATE_FILE.exists():
+			return {"next_index": 0, "static_used": False}
+		try:
+			stored = json.loads(STATE_FILE.read_text())
+			return {"next_index": int(stored["next_index"]),
+			        "static_used": bool(stored.get("static_used", False))}
+		except Exception as exc:
+			raise SystemExit(
+				f"{STATE_FILE} is unreadable ({exc}). Refusing to allocate: assuming zero "
+				f"would re-issue receiving addresses that may already be live.") from None
+
+	@classmethod
+	def _read_counter(cls):
+		return cls._read_state()["next_index"]
+
+	def _save(self):
+		"""Replace the stored state atomically and durably.
+
+		`write_text` truncates first, so a crash mid-write leaves a file that
+		parses as nothing -- and the reader above would then refuse to start.
+		Write a temporary, flush it to the platter, rename over the original,
+		then flush the directory so the rename itself survives.
+		"""
+		temporary = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+		with open(temporary, "w") as handle:
+			# MONOTONIC. Once a shared recipient has backed a sale it has done so
+			# forever, so this flag may only ever go from false to true -- a
+			# derived-mode save must not be able to clear a static deployment's
+			# record of it.
+			handle.write(json.dumps({"next_index": self._next,
+			                         "static_used": self._static_spent
+			                         or self._read_state()["static_used"]}))
+			handle.flush()
+			os.fsync(handle.fileno())
+		os.replace(temporary, STATE_FILE)
+		directory = os.open(STATE_FILE.parent or ".", os.O_RDONLY)
+		try:
+			os.fsync(directory)
+		finally:
+			os.close(directory)
+
+	@contextlib.contextmanager
+	def _across_processes(self):
+		"""Serialise the read-modify-write against other PROCESSES.
+
+		A `threading.Lock` reaches one interpreter. Two workers each loaded the
+		counter at start-up, each locked their own object, and each handed out
+		index 10. Your real answer is a database sequence or a locked allocator
+		row; this is the file-lock equivalent for a single-host example.
+		"""
+		STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+		with open(str(STATE_FILE) + ".lock", "w") as handle:
+			fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+			try:
+				yield
+			finally:
+				fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+	@property
+	def per_sale(self):
+		return self._account is not None
+
+	def _address(self, index):
+		child = hd.derive_path(self._account, f"0/{index}")
+		return DERIVATIONS[self._rail.network.namespace](child, self._rail.network.is_testnet)
+
+	def allocate(self, sale_id):
+		with self._lock:
+			if not self.per_sale:
+				# ONE SALE FOR THE ADDRESS'S WHOLE LIFETIME, not one at a time.
+				# A finished sale's QR is still payable, so the next sale at
+				# this address settles on the previous customer's money. There
+				# is no sequential version of a shared address that is safe.
+				with self._across_processes():
+					self._static_spent = self._read_state()["static_used"]
+					if self._open or self._static_spent:
+						raise ValueError(
+							"this deployment has no per-sale address source, and its single "
+							"recipient has already been used. An address that was shown to a "
+							"payer can still be paid, so it can never back a second sale. "
+							"Set CRYPTOPOS_XPUB.")
+					self._static_spent = True
+					self._save()
+				self._open[sale_id] = self._shared
+				return -1, self._shared
+			with self._across_processes():
+				self._next = self._read_counter()      # re-read INSIDE the lock
+				index, self._next = self._next, self._next + 1
+				self._save()                           # durable BEFORE the address is shown
+			address = self._address(index)
+			self._open[sale_id] = address
+			return index, address
+
+	def close(self, sale_id):
+		"""Forget an open sale. The ADDRESS is not returned to anything."""
+		with self._lock:
+			self._open.pop(sale_id, None)
+
+
+RAIL, CONFIG, RECIPIENTS, SERVER = None, None, None, None
+
+
 def load_rail():
+	global RECIPIENTS
 	registry = RailRegistry()
 	registry.discover()                      # every installed cryptopos-rail-* package
 	key = os.environ.get("CRYPTOPOS_RAIL")
 	if not key:
-		from memory_rail import MemoryRail   # the demo default; see recipe 9
+		from cryptopos_core.testing import MemoryRail   # ships in the wheel; see recipe 9
 		registry.register(MemoryRail())
 		key = MemoryRail.key
-	rail = registry.get(key)                 # raises RailNotInstalled, which is the honest answer
+	rail = registry.get(key)                 # raises RailNotInstalled, the honest answer
 	config = {"endpoint": os.environ.get("CRYPTOPOS_ENDPOINT", "memory://")}
-	config.update(DEMO_CHAIN if key.startswith("memory:") else {})
+	if key.startswith("memory:"):
+		config.update(DEMO_CHAIN)
 	require_conformant(rail, config)         # capability claims must match readiness
 	readiness = rail.readiness(config)
 	if not readiness.chargeable:
 		raise SystemExit(f"{key} cannot be charged here: {readiness.unavailable}")
+
+	xpub = os.environ.get("CRYPTOPOS_XPUB")
+	shared = os.environ.get("CRYPTOPOS_RECIPIENT", "")
+	if not xpub and not shared:
+		if key.startswith("memory:"):
+			xpub = DEMO_XPUB
+		else:
+			raise SystemExit(
+				"set CRYPTOPOS_XPUB for a derived address per sale, or CRYPTOPOS_RECIPIENT "
+				"to run one sale at a time at a fixed address (unsafe for real money: a QR "
+				"from a finished sale can still be paid, and would settle the next one).")
+	RECIPIENTS = Recipients(rail, xpub, shared)
 	return rail, config
 
 
 DEMO_CHAIN = {"tip": 60, "page": 20, "transfers": []}
-RAIL, CONFIG = None, None
-RECIPIENT = os.environ.get("CRYPTOPOS_RECIPIENT", "mem1alice")
+#: BIP-32 test vector 1. A published key with a published seed: fine for a demo
+#: whose coins do not exist, and never for anything else.
+DEMO_XPUB = ("xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJ"
+             "oCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
 
 
 def start_sale(amount_native):
-	verdict, why = RAIL.validate_recipient(RECIPIENT)
+	if not HEALTH["watching"]:
+		raise Unhealthy(HEALTH["why"])
+	# VALIDATE BEFORE ALLOCATING. An index is spent the moment it is taken, so
+	# a caller posting `amount=0` in a loop could otherwise walk the wallet
+	# past its gap limit without ever being shown an address.
+	if not isinstance(amount_native, int) or amount_native <= 0:
+		raise ValueError("amount must be a positive integer in the asset's smallest unit")
+	sale_id = f"sale-{uuid.uuid4().hex[:12]}"
+	index, recipient = RECIPIENTS.allocate(sale_id)
+	try:
+		return _open_sale(sale_id, amount_native, index, recipient)
+	except Exception:
+		RECIPIENTS.close(sale_id)            # the INDEX stays spent; only the slot is freed
+		raise
+
+
+def _open_sale(sale_id, amount_native, index, recipient):
+	verdict, why = RAIL.validate_recipient(recipient)
 	if verdict == "refused":
 		raise ValueError(f"receiving address refused: {why}")
 
-	# (2) CAPTURE THE BASELINE BEFORE THE PAYER SEES ANYTHING. It records the
+	# (3) CAPTURE THE BASELINE BEFORE THE PAYER SEES ANYTHING. It records the
 	# chain position the sale starts from. Capture it late and a transfer that
 	# arrived before this sale existed can be credited to it.
-	baseline = RAIL.capture_baseline(RECIPIENT, CONFIG)
+	baseline = RAIL.capture_baseline(recipient, CONFIG)
 	now = int(time.time())
 	intent = PaymentIntent(
-		intent_id=f"sale-{uuid.uuid4().hex[:12]}",
+		intent_id=sale_id,
 		rail_key=RAIL.key,
-		recipient=RECIPIENT,
+		recipient=recipient,
 		amount_native=amount_native,
 		created_at_epoch=now,
 		expires_at_epoch=now + WINDOW_SECONDS,
@@ -126,9 +403,11 @@ def start_sale(amount_native):
 	)
 	request = RAIL.create_request(intent)
 	return SALES.create({
-		"id": intent.intent_id, "intent": intent, "uri": request.uri,
+		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
-		"credited_native": 0, "transaction_ids": [], "expires_at": intent.expires_at_epoch,
+		"credited_native": 0, "sighted_native": 0, "transaction_ids": [],
+		"expires_at": intent.expires_at_epoch,
+		"recipient": recipient, "index": index, "notice": request.payer_notice,
 	})
 
 
@@ -136,7 +415,7 @@ def poll_once(sale):
 	"""One full observation cycle for one sale, then a settlement decision."""
 	intent = sale["intent"]
 
-	# (3) OBSERVE IS BOUNDED. It returns what it could read in one provider
+	# (4) OBSERVE IS BOUNDED. It returns what it could read in one provider
 	# call; loop until the batch reports `complete`, then decide. Deciding on
 	# a partial read is deciding on a partial payment.
 	batch = RAIL.observe(intent, CONFIG)
@@ -144,43 +423,118 @@ def poll_once(sale):
 		batch = RAIL.observe(intent, CONFIG, batch)
 
 	decision = RAIL.settle(intent, batch, claimed_transaction_ids=SALES.claimed())
-	if decision.state != "pending":
-		SALES.record(sale["id"], decision)
-	return decision
+	if decision.state == "pending":
+		return decision
+
+	outcome = SALES.record(sale["id"], decision)
+	if outcome == CLAIMED:
+		RECIPIENTS.close(sale["id"])
+		return decision
+	if outcome == ALREADY_DECIDED:
+		# Do not report this worker's stale view. The stored state is the answer,
+		# and there is no next poll for a sale that has left `open_sales()`.
+		return _stored_decision(sale["id"])
+	return decision.__class__("pending", 0, decision.sighted_native,
+	                          reason="a transaction was claimed by another sale")
+
+
+@dataclass(frozen=True)
+class StoredOutcome:
+	"""What a sale ALREADY decided, for a worker that arrived too late.
+
+	Deliberately not a `SettlementDecision`. It reports `expired`, which is not
+	a settlement state at all, and an earlier version filled `sighted_native`
+	from `credited_native` -- so a `needs-review` sale that had sighted 250 and
+	credited 0 was reported back as having sighted nothing, erasing the exact
+	evidence the review exists to show.
+	"""
+
+	state: str
+	credited_native: int
+	sighted_native: int
+	transaction_ids: tuple
+	reason: str
+
+
+def _stored_decision(sale_id):
+	stored = SALES.get(sale_id)
+	return StoredOutcome(stored["state"], stored["credited_native"], stored["sighted_native"],
+	                     tuple(stored["transaction_ids"]), stored["reason"])
 
 
 def demo_payer():
-	"""DEMO ONLY. Stands in for a customer with a wallet and the real chain.
-
-	With CRYPTOPOS_RAIL set this never runs: a real chain needs a real payer.
-	"""
+	"""DEMO ONLY. Stands in for a customer with a wallet and the real chain."""
 	while True:
 		time.sleep(8)
 		for sale in SALES.open_sales():
-			CONFIG["tip"] += 20                      # the chain moves on
+			CONFIG["tip"] += 20
 			CONFIG["transfers"].append({
-				"id": f"tx-{sale['id'][-6:]}", "to": RECIPIENT,
+				"id": f"tx-{sale['id'][-6:]}", "to": sale["recipient"],
 				"amount": sale["amount_native"], "confs": 3,
 				"height": CONFIG["tip"] - 5,
 			})
 
 
 def watcher():
-	"""Scheduling is the host's job. In production this is your job queue."""
+	"""Scheduling is the host's job. In production this is your job queue.
+
+	THE WHOLE LOOP IS SUPERVISED, not just the poll. Health used to be set only
+	around `poll_once`, so a failure in listing sales, in expiry, or in the
+	allocator killed this daemon thread while the server kept taking payments
+	nothing was left to watch -- quieter than a crash and worse.
+	"""
+	try:
+		_watch_loop()
+	except BaseException as exc:                     # noqa: BLE001 - the point
+		HEALTH.update(watching=False, why=f"{type(exc).__name__}: {exc}")
+		print(f"FATAL: the watcher stopped: {exc!r}")
+		print("  no new sales will be accepted, and the server is shutting down;")
+		print("  sales already open have live QR codes that nobody is now watching.")
+		if SERVER is not None:
+			threading.Thread(target=SERVER.shutdown, daemon=True).start()
+		raise
+
+
+def _watch_loop():
 	while True:
-		for sale in SALES.open_sales():
-			try:
-				poll_once(sale)
-			except Exception as exc:                      # a provider hiccup is not a verdict
-				print(f"  watch {sale['id']}: {type(exc).__name__}: {exc}")
+		_watch_one_pass(int(time.time()))
 		time.sleep(POLL_SECONDS)
+
+
+def _watch_one_pass(now):
+	"""One sweep over every open sale. Separated so it can be tested."""
+	for sale in SALES.open_sales():
+		try:
+			# LOOK ONE MORE TIME BEFORE CALLING IT UNPAID. A payment that
+			# confirmed between the last poll and the deadline is money the
+			# customer really sent; expiring without observing throws it
+			# away silently. And if this read fails, we do NOT know the
+			# sale was unpaid -- so the provider branch below leaves it
+			# open rather than expiring it on ignorance.
+			decision = poll_once(sale)
+			if decision.state == "pending" and now >= sale["expires_at"]:
+				# (see Recipients) The address is NOT recycled: the QR it
+				# issued is still payable by whoever kept it.
+				if SALES.expire(sale["id"], now):
+					RECIPIENTS.close(sale["id"])
+		except RailProviderError as exc:
+			# A PROVIDER ERROR IS NOT A VERDICT -- and it is the only thing
+			# this handler may swallow. Anything else repeats
+			# deterministically, and retrying it forever turns a paid sale
+			# into one nobody is told about.
+			print(f"  watch {sale['id']}: provider unavailable: {exc}")
+		# Anything that is not a provider error propagates to `watcher`,
+		# which stops the service. Retrying a deterministic fault forever
+		# turns a paid sale into one nobody is ever told about.
 
 
 # --------------------------------------------------------------------------
 # HTTP. The only framework-shaped code in the file.
 # --------------------------------------------------------------------------
 def qr_svg(uri):
-	"""(4) THE QR IS A GRID, NOT MARKUP -- draw it wherever you render."""
+	"""The QR is a GRID, not markup -- draw it wherever you render."""
+	from cryptopos_core.qr import modules_for
+
 	grid = modules_for(uri)
 	size, quiet = grid["size"], grid["quiet"]
 	side = size + quiet * 2
@@ -202,6 +556,7 @@ code{{background:#f4f4f5;padding:.15em .4em;border-radius:3px;word-break:break-a
 <h1>Pay {amount} {symbol}</h1>
 {qr}
 <p><code>{uri}</code></p>
+<p>{notice}</p>
 <p>Status: <span id="state">pending</span> <span id="why"></span></p>
 <script>
 setInterval(async () => {{
@@ -216,7 +571,8 @@ FORM = """<!doctype html><meta charset="utf-8"><title>Checkout</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:3rem auto;max-width:34rem}</style>
 <h1>New sale</h1><form method="post" action="/sales">
 <label>Amount in the smallest unit: <input name="amount" value="250"></label>
-<button>Charge</button></form>"""
+<button>Charge</button></form>
+<p><a href="/review">review queue</a></p>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -231,7 +587,22 @@ class Handler(BaseHTTPRequestHandler):
 	def do_GET(self):
 		path = urlparse(self.path).path
 		if path == "/":
+			if not HEALTH["watching"]:
+				return self._send(503, "<h1>Not taking sales</h1><p>The watcher stopped: "
+				                       f"{html.escape(HEALTH['why'])}</p>")
 			return self._send(200, FORM)
+		if path == "/review":
+			# (5) `needs-review` NEEDS SOMEWHERE TO GO. Everything here is
+			# escaped: `reason` is assembled from provider data, and a review
+			# page that interpolates it raw is an injection surface aimed at
+			# the one person who looks at payment problems.
+			rows = "".join(
+				f'<li><code>{html.escape(s["id"])}</code> — invoiced {s["amount_native"]}'
+				f' at <code>{html.escape(s["recipient"])}</code> — {html.escape(s["reason"])}</li>'
+				for s in SALES.in_review())
+			return self._send(200, "<!doctype html><meta charset=utf-8><title>Review</title>"
+			                       "<h1>Needs a person</h1><ul>"
+			                       + (rows or "<li>nothing</li>") + "</ul>")
 		if path.startswith("/sales/") and path.endswith("/state"):
 			sale = SALES.get(path.split("/")[2])
 			if sale is None:
@@ -246,8 +617,9 @@ class Handler(BaseHTTPRequestHandler):
 			if sale is None:
 				return self._send(404, "no such sale")
 			return self._send(200, PAGE.format(
-				amount=sale["amount_native"], symbol=RAIL.asset.symbol,
-				qr=qr_svg(sale["uri"]), uri=sale["uri"], id=sale["id"]))
+				amount=sale["amount_native"], symbol=html.escape(RAIL.asset.symbol),
+				qr=qr_svg(sale["uri"]), uri=html.escape(sale["uri"]),
+				notice=html.escape(sale["notice"]), id=html.escape(sale["id"])))
 		return self._send(404, "not found")
 
 	def do_POST(self):
@@ -257,8 +629,10 @@ class Handler(BaseHTTPRequestHandler):
 		fields = parse_qs(self.rfile.read(length).decode())
 		try:
 			sale = start_sale(int(fields.get("amount", ["0"])[0]))
+		except Unhealthy as exc:
+			return self._send(503, f"not taking sales: {html.escape(str(exc))}")
 		except Exception as exc:
-			return self._send(400, f"refused: {exc}")
+			return self._send(400, f"refused: {html.escape(str(exc))}")
 		self.send_response(303)
 		self.send_header("Location", f"/sales/{sale['id']}")
 		self.end_headers()
@@ -270,13 +644,17 @@ class Handler(BaseHTTPRequestHandler):
 def main():
 	global RAIL, CONFIG
 	RAIL, CONFIG = load_rail()
-	print(f"rail {RAIL.key} -> {RECIPIENT}")
+	binding = "a derived address per sale" if RECIPIENTS.per_sale else \
+		"ONE shared address -- one open sale at a time, and unsafe for real money"
+	print(f"rail {RAIL.key} -- {binding}")
 	threading.Thread(target=watcher, daemon=True).start()
 	if RAIL.key.startswith("memory:"):
 		threading.Thread(target=demo_payer, daemon=True).start()
 		print("demo rail: a scripted payer settles each sale about 8s after you charge it")
-	print("http://127.0.0.1:8099")
-	ThreadingHTTPServer(("127.0.0.1", 8099), Handler).serve_forever()
+	print("http://127.0.0.1:8099        (review queue: /review)")
+	global SERVER
+	SERVER = ThreadingHTTPServer(("127.0.0.1", 8099), Handler)
+	SERVER.serve_forever()
 
 
 if __name__ == "__main__":

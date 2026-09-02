@@ -16,7 +16,7 @@ bot, or a script with nothing under it.
 from cryptopos_core.registry import RailRegistry
 
 registry = RailRegistry()
-registry.discover()                 # every installed cryptopos-rail-* package
+registry.discover()                 # every plugin in the cryptopos.rails entry-point group
 ```
 
 **New here? Read [The five calls](#the-five-calls), run
@@ -85,20 +85,34 @@ settle(intent, batch, claimed_ids)    pending | settled | needs-review
 `readiness(config)` sits outside the sale: ask it once at start-up to find out
 which rails this deployment can actually charge.
 
-**The four things a host must get wrong-proof.** Each of these has cost this
+**The five things a host must get wrong-proof.** Each of these has cost this
 project real money at least once:
 
-1. **Persist `decision.transaction_ids` atomically with the settled state.**
-   `settle` is pure. It will credit the same transfer to a second sale unless
-   you pass what is already spent as `claimed_transaction_ids`.
-2. **Capture the baseline before the payer sees the request.** It pins the
+1. **Two open sales must not share a receiving address.** On any rail whose
+   `binding_category` is `not-unconditional` — which is most of them — the
+   first sale to poll credits every unclaimed transfer it can see, including
+   the other sale's. No race is needed. Reproduced against the example in this
+   repository: a sale invoiced 100 settled on 350 and left the customer who
+   paid 250 unpaid. And "share" includes *one after the other* — an address
+   that was shown to a payer can still be paid, so a finished sale's QR settles
+   whatever sale holds that address next. Derive an address per sale, allocate
+   each one once, and never reissue it.
+2. **Claim `decision.transaction_ids` exclusively, in the same write as the
+   settled state.** `settle` is pure: it credits whatever you did not tell it
+   was already spent. Reading the claimed set, settling, then writing is the
+   obvious shape and it is wrong — two workers read the same set before either
+   writes, and one transfer settles two invoices. What saves you is that
+   claiming an id can *fail*: a `PRIMARY KEY` on the credited transaction id,
+   and the losing `INSERT` rolling back the sale state with it.
+3. **Capture the baseline before the payer sees the request.** It pins the
    chain position the sale starts from. Capture it late and a transfer that
    predates the sale can be credited to it.
-3. **Loop `observe` until the batch reports `.complete`.** It returns what one
+4. **Loop `observe` until the batch reports `.complete`.** It returns what one
    provider call could read. Deciding on a partial read is deciding on a
    partial payment.
-4. **`needs-review` is a real outcome, not an error.** It means money is
-   involved and the rail will not guess whose it is. Route it to a person.
+5. **`needs-review` is a real outcome, not an error, and it needs somewhere to
+   go.** It means money is involved and the rail will not guess whose it is.
+   A status string is not a queue; give a person a list they actually see.
 
 ---
 
@@ -107,15 +121,16 @@ project real money at least once:
 ## 1. Take one payment, start to finish
 
 This runs with no chain and no funds: `MemoryRail` is a scripted rail that
-ships in [`examples/`](examples/memory_rail.py) (recipe 8 builds it). Swap it
-for `registry.discover()` and a real rail key and nothing else changes.
+ships **in the package**, so it works from a plain `pip install` (recipe 8
+builds one). Swap it for `registry.discover()` and a real rail key and nothing
+else changes.
 
 <!-- readme: new -->
 ```python
 from cryptopos_core.conformance import require_conformant
 from cryptopos_core.plugin import PaymentIntent
 from cryptopos_core.registry import RailRegistry
-from memory_rail import MemoryRail
+from cryptopos_core.testing import MemoryRail
 
 registry = RailRegistry()
 registry.register(MemoryRail())
@@ -133,7 +148,7 @@ mistake is still free:
 rail.validate_recipient("mem1alice")     # -> ('ok', '')
 ```
 
-Now capture the baseline, **then** build the request. The order matters (point 2
+Now capture the baseline, **then** build the request. The order matters (point 3
 above):
 
 ```python
@@ -160,7 +175,7 @@ chain["transfers"] = [
 ```
 
 Poll. `observe` is bounded, so loop until it says it has caught up with the
-provider's tip (point 3):
+provider's tip (point 4):
 
 ```python
 batch = rail.observe(intent, chain)
@@ -172,7 +187,7 @@ len(batch.transfers)                     # -> 1
 ```
 
 Then decide. `claimed_transaction_ids` is every transaction id your database has
-already credited to *any* sale (point 1):
+already credited to *any* sale (point 2):
 
 ```python
 decision = rail.settle(intent, batch, claimed_transaction_ids=frozenset())
@@ -207,14 +222,28 @@ python3 examples/checkout_server.py
 # http://127.0.0.1:8099
 ```
 
-Point it at a real chain with three environment variables and no code change:
+Point it at a real chain with environment variables and no code change:
 
 ```bash
 pip install cryptopos-rail-bitcoin
 CRYPTOPOS_RAIL=bitcoin:testnet4/native:btc \
 CRYPTOPOS_ENDPOINT=https://mempool.space/testnet4/api \
-CRYPTOPOS_RECIPIENT=tb1q... python3 examples/checkout_server.py
+CRYPTOPOS_XPUB=tpub... python3 examples/checkout_server.py
 ```
+
+`CRYPTOPOS_XPUB` is the **account** extended public key. Give it one and every
+sale gets its own derived address, allocated once and never reissued.
+
+Give it `CRYPTOPOS_RECIPIENT` instead — a single fixed address — and the server
+accepts exactly **one sale, ever**, then refuses. Not one at a time: one. A
+payment instruction cannot be withdrawn, so the QR from a finished sale is still
+payable, and the next sale at that address would settle on the previous
+customer's money. "One at a time" sounds like the safe version of a shared
+address and is not; there isn't one.
+
+(`examples/` is in the repository and the sdist, not the wheel. `pip install`
+gives you `cryptopos_core.testing`, which every recipe here uses; clone the
+repository for the server.)
 
 The three pieces worth lifting into your own app, whatever it is written in:
 
@@ -233,28 +262,61 @@ def load_rail(key, config):
     return rail
 ```
 
-**Make the credited-id set part of the same write as the state.** In the example
-it is a lock around a dict; in your app it is one SQL transaction:
+**Let the database refuse a transaction that is already spent.** The claimed
+set is not a cache you read before deciding — it is a uniqueness constraint that
+makes the second claim fail:
+
+<!-- readme: skip -->
+```sql
+CREATE TABLE credited_tx (
+    tx_id   TEXT PRIMARY KEY,
+    sale_id TEXT NOT NULL REFERENCES sale(id)   -- no orphan claims
+);
+```
 
 <!-- readme: skip -->
 ```python
-with db.transaction():
-    db.execute("UPDATE sale SET state=?, credited=? WHERE id=?",
-               (decision.state, decision.credited_native, sale_id))
-    db.executemany("INSERT INTO credited_tx (tx_id) VALUES (?)",
-                   [(t,) for t in decision.transaction_ids])
+try:
+    with db.transaction():
+        # The transition is CONDITIONAL. A worker arriving late holds a
+        # decision from a stale snapshot -- typically `needs-review`, which
+        # carries NO transaction ids, so the PRIMARY KEY above cannot catch
+        # it. Only `AND state = 'pending'` can.
+        rows = db.execute(
+            "UPDATE sale SET state=?, credited=? WHERE id=? AND state='pending'",
+            (decision.state, decision.credited_native, sale_id)).rowcount
+        if rows != 1:
+            raise AlreadyDecided(sale_id)      # abort; claim nothing
+        db.executemany("INSERT INTO credited_tx (tx_id, sale_id) VALUES (?, ?)",
+                       [(t, sale_id) for t in decision.transaction_ids])
+except UniqueViolation:                        # NOT bare IntegrityError
+    pass          # another sale claimed it first: stay pending, poll again
+except AlreadyDecided:
+    pass          # this sale already has an answer; the stored one is the truth
 ```
 
-**Let a provider error stay an error.** A failed read is not a verdict; leave
-the sale pending and try again on the next tick.
+Three details, each of which has a failure behind it. The **rollback** is why a
+sale is never marked paid on someone else's money. The **row count** is why a
+stale worker cannot reopen a settled sale — the uniqueness constraint is blind
+to a decision that claims nothing. And catching **the uniqueness violation
+specifically**, rather than every `IntegrityError`, is why an unrelated
+constraint failure is not silently misread as a lost claim race.
+
+**Let a provider error stay an error — and only a provider error.** A failed
+read is not a verdict; leave the sale pending and try again. But catching
+everything is worse than catching nothing:
 
 <!-- readme: skip -->
 ```python
 for sale in open_sales():
     try:
         poll_once(sale)
-    except Exception as exc:
-        log.warning("watch %s: %s", sale.id, exc)   # NOT: mark it failed
+    except RailProviderError as exc:
+        log.warning("watch %s: provider unavailable: %s", sale.id, exc)
+    # An InvalidRailPlugin, an integrity violation, or a bug in your own code
+    # repeats deterministically. Swallowing those retries them forever, and the
+    # customer's money sits on-chain against a sale nobody is told about.
+    # Let them raise, fail the job, and page someone.
 ```
 
 FastAPI, Flask and Django change only the outermost layer: a route that calls
@@ -314,7 +376,10 @@ Quoting needs the network, so this block is shown rather than run:
 from cryptopos_core import rates
 
 microcents, source, ok = rates.quote("btc", "mainnet")
-#   -> (64001234000, "coinbase+kraken+bitstamp", True)     # $64,001.234
+#   e.g. (64001234000, "coinbase+kraken+bitstamp", True)   # $64,001.234
+# The number depends on what the feeds say when you ask, so it is an
+# illustration rather than a claim. The arrow notation used elsewhere in this
+# file is reserved for values the gate actually evaluates.
 ```
 
 `ok` is `False` when the number is a fallback rather than a quote — it is never
@@ -425,11 +490,25 @@ offered                                  # -> ['memory:testnet/native:tok']
 A rail that is not ready tells you why, per capability, rather than disappearing:
 
 ```python
-offered, withheld = payment_options(registry, lambda key: {"endpoint": ""})
+unset = {"endpoint": "", "tip": 60, "page": 20}          # everything but the endpoint
+offered, withheld = payment_options(registry, lambda key: unset)
 offered                                  # -> []
 dict(withheld["memory:testnet/native:tok"])["observation"]
 #   -> 'no endpoint configured'
 ```
+
+Per capability means *per capability*: an unreachable provider stops this rail
+observing and settling, and does not stop it checking an address or building a
+request, because those read nothing.
+
+```python
+sorted(registry.get("memory:testnet/native:tok").readiness(unset).ready)
+#   -> ['address-validation', 'payment-request']
+```
+
+Readiness reports what this deployment can actually do, not what the rail can
+do in principle. A configuration that would leave the observation loop unable
+to advance is refused here rather than discovered halfway through a sale.
 
 `chargeable` means all four capabilities passed *this deployment's* checks. It
 does **not** mean the payment is bound to the sale — see
@@ -459,27 +538,38 @@ Expiry is yours: the rail does not know your refund policy.
 together. A settled decision can never carry zero ids; the dataclass refuses to
 be constructed that way.
 
-**`needs-review`** — the rail saw money it will not attribute, or could not
-establish a transaction's status. This is the state that protects you. It is
-raised, among other cases, when a transfer arrives that the rail cannot prove
-belongs to this sale:
+**`needs-review`** — the rail saw money and will not decide whose it is, or
+could not establish a transaction's status at all. This is the state that
+protects you. Here the provider was asked about a transfer and did not answer:
 
 ```python
-partial = rail.settle(intent, batch, claimed_transaction_ids=frozenset({"tx-a"}))
-partial.state                            # -> 'pending'
-partial.sighted_native                   # -> 250
+doubted = {**chain, "transfers": [
+    {"id": "tx-?", "to": "mem1alice", "amount": 250, "confs": 3,
+     "height": 71, "unreadable": True},      # the provider was asked; it did not answer
+]}
+verdict = rail.settle(intent, rail.observe(intent, doubted))
+verdict.state                            # -> 'needs-review'
+verdict.credited_native                  # -> 0
+verdict.sighted_native                   # -> 250
 ```
 
-Note `sighted_native` stays 250 while `credited_native` is 0: the rail reports
-what it saw *and* what it was willing to credit, and the gap is the thing a
-human needs to look at. Never resolve `needs-review` automatically.
+`sighted_native` is 250 while `credited_native` is 0: the rail reports what it
+saw *and* what it was willing to credit, and the gap is exactly what a human
+has to look at. **Never resolve `needs-review` automatically**, and give it a
+real destination — a status string nobody queries is not a queue.
+
+The distinction that makes this state worth having is between *"the chain says
+this money did not move"* and *"I could not find out"*. The first is a
+decision; the second is the absence of one, and a terminal state taken on it is
+a sale lost to a transient read.
 
 ## 8. Write your own rail
 
 A rail is a plain object with four attributes and six methods. No base class, no
-registration decorator, no import-time side effects. This is the whole of
-[`examples/memory_rail.py`](examples/memory_rail.py), the scripted rail every
-recipe above runs on:
+registration decorator, no import-time side effects. Here are the declarations
+of [`cryptopos_core.testing.MemoryRail`](src/cryptopos_core/testing.py) with
+the bodies elided — read that file for the working implementation, which is the
+scripted rail every recipe above runs on:
 
 <!-- readme: skip -->
 ```python
@@ -535,7 +625,7 @@ my-network-token = "my_rail:my_network_token"
 
 ## 9. Test your host with no chain, no funds, no network
 
-This is what `MemoryRail` is really for. Your host's bugs — the double-credit,
+This is what `cryptopos_core.testing.MemoryRail` is really for. Your host's bugs — the double-credit,
 the partial read, the late baseline — are all reachable without a chain, and
 they are the bugs that cost money.
 
@@ -568,6 +658,35 @@ while not batch.complete:
 reads > 1                                # -> True
 rail.settle(part, batch).state           # -> 'settled'
 ```
+
+**One transfer cannot pay two sales — if you claim it.** This is the scenario
+that breaks hosts, so it is worth having as a test of your own:
+
+```python
+shared = scripted({"id": "tx-shared", "amount": 100, "height": 71}, tip=100)
+opened = rail.capture_baseline("mem1alice", {"tip": 60})
+
+def sale(name):
+    return PaymentIntent(name, rail.key, "mem1alice", 100, 1_787_100_000,
+                         1_787_101_800, baseline=opened)
+
+credited = set()
+sale_a = sale("sale-a")
+first = rail.settle(sale_a, rail.observe(sale_a, shared), frozenset(credited))
+first.state                              # -> 'settled'
+credited.update(first.transaction_ids)
+
+sale_b = sale("sale-b")
+second = rail.settle(sale_b, rail.observe(sale_b, shared), frozenset(credited))
+second.state                             # -> 'pending'
+```
+
+That second `pending` is entirely the host's doing. The rail credited honestly
+both times; what stopped the double payment was `credited` having grown first.
+So the property you must actually test is not this call — it is that **two
+concurrent workers cannot both observe `credited` without it**. Reading it,
+settling, and then updating it is a lost update, and a lost update here is a
+customer's money paying someone else's invoice.
 
 **A batch from another sale is refused rather than misapplied:**
 
@@ -605,12 +724,20 @@ It is intentionally stricter than "a QR can be built".
 
 ## Installable rails, and what core drives
 
-**Core drives no rails of its own.** `register_builtins()` registers six
+**Core drives no rail on any real network.** `register_builtins()` registers six
 *request-only* catalogue entries — chains this package can describe and build a
-payment request for, and cannot observe or settle. Every drivable rail is an
-installed package discovered through the `cryptopos.rails` entry-point group.
-Asking the registry for one without installing it raises `RailNotInstalled`,
-which is the honest answer rather than a stub.
+payment request for, and cannot observe or settle. Every rail that moves real
+money is an installed package discovered through the `cryptopos.rails`
+entry-point group. Asking the registry for one without installing it raises
+`RailNotInstalled`, which is the honest answer rather than a stub.
+
+The one exception is deliberate and cannot reach a chain:
+`cryptopos_core.testing.MemoryRail` is fully conformant — it registers, passes
+`require_conformant`, observes and settles — because a test double that the
+protocol would reject cannot test a host against the protocol. It names a
+network that does not exist, publishes no entry point, and is not returned by
+`register_builtins()`, so `discover()` will never find it and no deployment can
+acquire it by accident. You have to import it on purpose.
 
 ```python
 from cryptopos_core.registry import RailRegistry
