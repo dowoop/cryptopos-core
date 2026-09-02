@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.1.1
+
+Documentation and packaging only; no behaviour changed.
+
+* README.md is now a cookbook: nine task-shaped recipes covering one payment
+  end to end, a web checkout, QR rendering, pricing, address refusal, rail
+  selection, the three settlement outcomes, writing a rail, and testing a host
+  with no chain. The reference material it had before is kept below them.
+* Added `examples/checkout_server.py`, a complete stdlib checkout — form, QR,
+  status endpoint, background watcher — that runs with no chain, no funds and
+  no configuration, and points at a real rail through three environment
+  variables. Added `examples/memory_rail.py`, the scripted rail it and the
+  README recipes run on.
+* Added `tools/readme.py`, which executes every Python example in README.md and
+  fails if a `# ->` claim is untrue. `--wheel` runs them against `dist/*.whl`
+  and refuses a wheel whose version does not match this tree, so a stale
+  artefact cannot report an old package green.
+* Corrected the package docstring, which shipped two false claims in 2.1.0:
+  `register_builtins()` returns six rails and not twelve, and the chain reader
+  moved to `cryptopos_rail_ootle.chain` in 2.0.
+* `examples/` and `tools/` now ship in the sdist, so the files README.md links
+  to are present in the distribution.
+
 ## 1.1.0
 
 The package is now an installable payment-rail kernel rather than only a set

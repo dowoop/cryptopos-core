@@ -1,10 +1,33 @@
 # cryptopos-core
 
-A dependency-free payment-rail kernel for Python. Install blockchain payments
-into a web app, ERP, terminal, bot, game, or service without importing a host
-framework. A rail declares a concrete network and asset, then independently
-reports whether it can validate recipients, build payer instructions, observe
-transfers, and settle them.
+Take blockchain payments in Python without adopting a framework, a wallet, or a
+custodian. A *rail* is one asset on one named network; it builds the payer's
+instruction, watches for the money, and returns a settlement decision. Your
+application keeps the database, the scheduler, and the sale.
+
+```bash
+pip install cryptopos-core cryptopos-rail-bitcoin
+```
+
+Zero dependencies, standard library only. Works in a web app, an ERP, a till, a
+bot, or a script with nothing under it.
+
+```python
+from cryptopos_core.registry import RailRegistry
+
+registry = RailRegistry()
+registry.discover()                 # every installed cryptopos-rail-* package
+```
+
+**New here? Read [The five calls](#the-five-calls), run
+[Recipe 1](#1-take-one-payment-start-to-finish), then copy
+[`examples/checkout_server.py`](examples/checkout_server.py).** That is a
+complete checkout — form, QR, polling, settlement — in one stdlib file you can
+run right now with no chain, no funds, and no configuration:
+
+```bash
+python3 examples/checkout_server.py     # http://127.0.0.1:8099
+```
 
 ## Status — read this before you take money with it
 
@@ -12,7 +35,7 @@ transfers, and settle them.
 AI review. No external security audit has been performed, and it has never
 handled mainnet funds.
 
-**What has been proven, and how.** Every rail below has settled real testnet
+**What has been proven, and how.** Every drivable rail has settled real testnet
 money in the parent project, where these adapters shipped built into core. As of
 2026-08-31 one rail has also settled real money through the *published* packages
 — installed as wheels, resolved through the `cryptopos.rails` entry point,
@@ -36,6 +59,531 @@ conversion that made every payment look late, a test fixture that agreed with
 the defect it was meant to catch, and an adapter asked with another chain's RPC
 method. **A green suite is not evidence that a rail works.**
 
+Every Python example in this file is executed by `tools/readme.py` against the
+built wheel, so the recipes below are checked rather than remembered. Blocks
+that need a live chain or real funds are marked and shown but not run.
+
+---
+
+## The five calls
+
+Whatever your framework, the integration is the same five calls in the same
+order. Everything else in your host is storage and scheduling.
+
+```
+validate_recipient(addr)              is this address safe to be paid at?
+        │
+capture_baseline(addr, config)        where does the chain stand right now?
+        │                             ── the payer must not see anything yet ──
+create_request(intent)                the URI/QR the customer pays
+        │
+observe(intent, config, previous)     one bounded read; loop until .complete
+        │
+settle(intent, batch, claimed_ids)    pending | settled | needs-review
+```
+
+`readiness(config)` sits outside the sale: ask it once at start-up to find out
+which rails this deployment can actually charge.
+
+**The four things a host must get wrong-proof.** Each of these has cost this
+project real money at least once:
+
+1. **Persist `decision.transaction_ids` atomically with the settled state.**
+   `settle` is pure. It will credit the same transfer to a second sale unless
+   you pass what is already spent as `claimed_transaction_ids`.
+2. **Capture the baseline before the payer sees the request.** It pins the
+   chain position the sale starts from. Capture it late and a transfer that
+   predates the sale can be credited to it.
+3. **Loop `observe` until the batch reports `.complete`.** It returns what one
+   provider call could read. Deciding on a partial read is deciding on a
+   partial payment.
+4. **`needs-review` is a real outcome, not an error.** It means money is
+   involved and the rail will not guess whose it is. Route it to a person.
+
+---
+
+# Cookbook
+
+## 1. Take one payment, start to finish
+
+This runs with no chain and no funds: `MemoryRail` is a scripted rail that
+ships in [`examples/`](examples/memory_rail.py) (recipe 8 builds it). Swap it
+for `registry.discover()` and a real rail key and nothing else changes.
+
+<!-- readme: new -->
+```python
+from cryptopos_core.conformance import require_conformant
+from cryptopos_core.plugin import PaymentIntent
+from cryptopos_core.registry import RailRegistry
+from memory_rail import MemoryRail
+
+registry = RailRegistry()
+registry.register(MemoryRail())
+rail = registry.get("memory:testnet/native:tok")
+
+chain = {"endpoint": "memory://", "tip": 60, "page": 20, "transfers": []}
+require_conformant(rail, chain)          # capability claims must match readiness
+rail.readiness(chain).chargeable         # -> True
+```
+
+Check the address before anything else. This is the last moment at which a
+mistake is still free:
+
+```python
+rail.validate_recipient("mem1alice")     # -> ('ok', '')
+```
+
+Now capture the baseline, **then** build the request. The order matters (point 2
+above):
+
+```python
+baseline = rail.capture_baseline("mem1alice", chain)
+intent = PaymentIntent(
+    intent_id="sale-1042",
+    rail_key=rail.key,
+    recipient="mem1alice",
+    amount_native=250,                   # smallest unit; never a float
+    created_at_epoch=1_787_100_000,
+    expires_at_epoch=1_787_101_800,
+    baseline=baseline,
+)
+rail.create_request(intent).uri          # -> 'memory:mem1alice?amount=250'
+```
+
+Show that URI to the customer. Time passes; the chain moves; the money arrives:
+
+```python
+chain["tip"] = 100
+chain["transfers"] = [
+    {"id": "tx-a", "to": "mem1alice", "amount": 250, "confs": 3, "height": 71},
+]
+```
+
+Poll. `observe` is bounded, so loop until it says it has caught up with the
+provider's tip (point 3):
+
+```python
+batch = rail.observe(intent, chain)
+while not batch.complete:
+    batch = rail.observe(intent, chain, batch)
+
+batch.observed_through_tip               # -> 100
+len(batch.transfers)                     # -> 1
+```
+
+Then decide. `claimed_transaction_ids` is every transaction id your database has
+already credited to *any* sale (point 1):
+
+```python
+decision = rail.settle(intent, batch, claimed_transaction_ids=frozenset())
+decision.state                           # -> 'settled'
+decision.credited_native                 # -> 250
+decision.transaction_ids                 # -> ('tx-a',)
+```
+
+Store `decision.transaction_ids` in the same database transaction that writes
+the state. Here is what that guard buys you — the same transfer, offered to a
+second sale, is refused:
+
+```python
+replay = rail.settle(intent, batch, claimed_transaction_ids=frozenset({"tx-a"}))
+replay.state                             # -> 'pending'
+```
+
+Without it, one transfer settles two invoices.
+
+## 2. Put it behind a web page
+
+[`examples/checkout_server.py`](examples/checkout_server.py) is a complete
+checkout in one file: an amount form, a QR page, a JSON status endpoint the page
+polls, and a background watcher. It is `http.server` and nothing else, because
+the only framework-shaped code in a crypto checkout is "read a request, write a
+response" — the rest is the five calls.
+
+```bash
+python3 examples/checkout_server.py
+# rail memory:testnet/native:tok -> mem1alice
+# demo rail: a scripted payer settles each sale about 8s after you charge it
+# http://127.0.0.1:8099
+```
+
+Point it at a real chain with three environment variables and no code change:
+
+```bash
+pip install cryptopos-rail-bitcoin
+CRYPTOPOS_RAIL=bitcoin:testnet4/native:btc \
+CRYPTOPOS_ENDPOINT=https://mempool.space/testnet4/api \
+CRYPTOPOS_RECIPIENT=tb1q... python3 examples/checkout_server.py
+```
+
+The three pieces worth lifting into your own app, whatever it is written in:
+
+**Build the registry once, at start-up, not per request.** `discover()` reads
+entry points and validates every plugin; that is start-up work.
+
+```python
+def load_rail(key, config):
+    registry = RailRegistry()
+    registry.discover()
+    rail = registry.get(key)             # raises RailNotInstalled if absent
+    require_conformant(rail, config)
+    readiness = rail.readiness(config)
+    if not readiness.chargeable:
+        raise SystemExit(f"{key} cannot be charged here: {readiness.unavailable}")
+    return rail
+```
+
+**Make the credited-id set part of the same write as the state.** In the example
+it is a lock around a dict; in your app it is one SQL transaction:
+
+<!-- readme: skip -->
+```python
+with db.transaction():
+    db.execute("UPDATE sale SET state=?, credited=? WHERE id=?",
+               (decision.state, decision.credited_native, sale_id))
+    db.executemany("INSERT INTO credited_tx (tx_id) VALUES (?)",
+                   [(t,) for t in decision.transaction_ids])
+```
+
+**Let a provider error stay an error.** A failed read is not a verdict; leave
+the sale pending and try again on the next tick.
+
+<!-- readme: skip -->
+```python
+for sale in open_sales():
+    try:
+        poll_once(sale)
+    except Exception as exc:
+        log.warning("watch %s: %s", sale.id, exc)   # NOT: mark it failed
+```
+
+FastAPI, Flask and Django change only the outermost layer: a route that calls
+`start_sale`, a route that returns the state as JSON, and a job in your existing
+queue instead of the example's thread.
+
+## 3. Draw the QR
+
+`modules_for` returns a grid of bits, not markup — deliberately. Hosts that
+sanitise stored HTML strip exactly the attributes an SVG needs (`d`, `fill`),
+leaving a well-formed and completely blank image. Send the bits; draw them at
+the surface.
+
+```python
+from cryptopos_core.qr import modules_for
+
+grid = modules_for("bitcoin:tb1qexample?amount=0.00125")
+grid["size"]                             # -> 29
+grid["quiet"]                            # -> 4
+len(grid["rows"])                        # -> 29
+```
+
+Each row is a string of `"0"`/`"1"`. The quiet zone is *not* included in the
+rows — add `quiet` modules of margin yourself, on all four sides. Scanners fail
+intermittently without it, and intermittently is the worst way for a payment
+surface to fail: it looks like the customer's phone.
+
+```python
+def qr_svg(uri, scale=8):
+    grid = modules_for(uri)
+    quiet, side = grid["quiet"], grid["size"] + grid["quiet"] * 2
+    squares = "".join(
+        f'<rect x="{x + quiet}" y="{y + quiet}" width="1" height="1"/>'
+        for y, row in enumerate(grid["rows"])
+        for x, module in enumerate(row) if module == "1"
+    )
+    return (f'<svg viewBox="0 0 {side} {side}" width="{side * scale}" '
+            f'height="{side * scale}" shape-rendering="crispEdges">'
+            f'<rect width="{side}" height="{side}" fill="#fff"/>'
+            f'<g fill="#000">{squares}</g></svg>')
+
+qr_svg("bitcoin:tb1qexample?amount=0.00125").startswith("<svg")   # -> True
+```
+
+`shape-rendering="crispEdges"` is not decoration: without it a browser
+antialiases module edges and a phone camera can lose the symbol.
+
+## 4. Price the sale in the customer's money
+
+Your customer thinks in dollars; the chain thinks in integers. Two steps, and
+the second one is the one that has a trap in it.
+
+Quoting needs the network, so this block is shown rather than run:
+
+<!-- readme: skip -->
+```python
+from cryptopos_core import rates
+
+microcents, source, ok = rates.quote("btc", "mainnet")
+#   -> (64001234000, "coinbase+kraken+bitstamp", True)     # $64,001.234
+```
+
+`ok` is `False` when the number is a fallback rather than a quote — it is never
+dressed up as a feed answer, and on mainnet a fallback is refused outright.
+Microcents are cents × 10⁴; [why](#why-microcents) is worth two minutes.
+
+Now convert. **Use `rails.invoice_amount`, not the lower-level helpers:**
+
+```python
+from cryptopos_core import rails
+
+btc = rails.rail_for("btc")
+rails.invoice_amount(btc, usd_cents=1099, rate_microcents=64001234000)   # -> 17171
+```
+
+The trap: a decimal-amount URI (BIP-21, Solana Pay, ZIP-321) carries the
+*display* form, which truncates. Price a Solana sale through the lower-level
+`rates.native_for` and the QR can ask for 73,266,000 lamports against an invoice
+of 73,266,666. The customer pays exactly what they were shown and the sale sits
+666 short of itself forever. `invoice_amount` cannot produce such an amount, and
+`build_uri` raises `AmountNotRepresentable` rather than emit one.
+
+Rounding once at display precision also stops a small amount vanishing on an
+18-decimal chain:
+
+```python
+eth = rails.rail_for("eth")
+wei = rails.usd_cents_to_native(eth, usd_cents=625)
+wei                                      # -> 1785000000000000
+rails.format_amount(eth, wei)            # -> '0.001785'
+```
+
+## 5. Refuse a bad receiving address
+
+An address that is wrong is money sent somewhere nobody holds a key to, and
+there is no step after that. So this is checksums, not pattern-matching:
+`^bc1[a-z0-9]{39}$` accepts a single-character typo that bech32 rejects.
+
+```python
+from cryptopos_core import addresses
+
+addresses.validate("btc", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "mainnet")
+#   -> ('ok', '')
+```
+
+The expensive mistake — valid, scannable, and money-losing:
+
+```python
+verdict, why = addresses.validate(
+    "btc", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "mainnet")
+verdict                                  # -> 'refused'
+```
+
+> that is a valid testnet address and this sale is mainnet; paying it would send
+> mainnet coin to a testnet key
+
+The verdict is three-valued, and `unchecked` is **not** a soft `ok`:
+
+```python
+addresses.validate("sol", "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", "mainnet")[0]
+#   -> 'unchecked'
+```
+
+Solana addresses carry no checksum and Tari's format is unspecified, so claiming
+those were verified would make the verdict meaningless. `build_uri` refuses
+`unchecked` on mainnet. Bech32/Bech32m (BIP-173/350), Base58Check, EIP-55 and
+Monero's Keccak checksum, all against published vectors, all stdlib.
+
+Building the URI yourself, when you are not going through a rail:
+
+```python
+from cryptopos_core import uri
+
+uri.build_uri("eth", {"address": "0x52908400098527886E0F7030069857D2E4169EE7"},
+              1785000000000000, mode="testnet")
+#   -> 'ethereum:0x52908400098527886E0F7030069857D2E4169EE7@11155111?value=1785000000000000'
+```
+
+`mode` is the sale's charge-time mode, so the chain id, token contract and
+network authority baked into the URI cannot change when an operator flips a
+setting mid-sale. The vocabulary is closed — `demo`, `testnet`, `mainnet` — and
+a typo is refused before a feed is called, so a misspelled mainnet sale can
+never become permissive demo behaviour.
+
+## 6. Offer only the rails you can actually charge today
+
+Installed is not the same as usable. A rail whose endpoint is unreachable, or
+whose provider does not serve the method it needs, must not appear as a payment
+option. Ask readiness, once, at start-up:
+
+```python
+def payment_options(registry, configuration_for):
+    """Rail keys a customer may actually be shown, with reasons for the rest."""
+    offered, withheld = [], {}
+    for key in registry.keys():
+        rail = registry.get(key)
+        readiness = rail.readiness(configuration_for(key))
+        if readiness.chargeable:
+            offered.append(key)
+        else:
+            withheld[key] = readiness.unavailable
+    return offered, withheld
+
+offered, withheld = payment_options(registry, lambda key: chain)
+offered                                  # -> ['memory:testnet/native:tok']
+```
+
+A rail that is not ready tells you why, per capability, rather than disappearing:
+
+```python
+offered, withheld = payment_options(registry, lambda key: {"endpoint": ""})
+offered                                  # -> []
+dict(withheld["memory:testnet/native:tok"])["observation"]
+#   -> 'no endpoint configured'
+```
+
+`chargeable` means all four capabilities passed *this deployment's* checks. It
+does **not** mean the payment is bound to the sale — see
+[Capability](#capability-and-what-chargeable-does-not-mean).
+
+## 7. Handle all three settlement outcomes
+
+`settle` returns one of exactly three states. A host that treats it as a boolean
+has a bug waiting for a bad day.
+
+```python
+def apply(decision, sale_id):
+    if decision.state == "settled":
+        return f"{sale_id}: paid {decision.credited_native}, ids {decision.transaction_ids}"
+    if decision.state == "pending":
+        return f"{sale_id}: keep watching — {decision.reason}"
+    return f"{sale_id}: A PERSON MUST LOOK — {decision.reason}"
+
+apply(decision, "sale-1042")
+#   -> 'sale-1042: paid 250, ids (\'tx-a\',)'
+```
+
+**`pending`** — nothing conclusive yet. Keep polling until your own expiry.
+Expiry is yours: the rail does not know your refund policy.
+
+**`settled`** — credited money and at least one transaction id, guaranteed
+together. A settled decision can never carry zero ids; the dataclass refuses to
+be constructed that way.
+
+**`needs-review`** — the rail saw money it will not attribute, or could not
+establish a transaction's status. This is the state that protects you. It is
+raised, among other cases, when a transfer arrives that the rail cannot prove
+belongs to this sale:
+
+```python
+partial = rail.settle(intent, batch, claimed_transaction_ids=frozenset({"tx-a"}))
+partial.state                            # -> 'pending'
+partial.sighted_native                   # -> 250
+```
+
+Note `sighted_native` stays 250 while `credited_native` is 0: the rail reports
+what it saw *and* what it was willing to credit, and the gap is the thing a
+human needs to look at. Never resolve `needs-review` automatically.
+
+## 8. Write your own rail
+
+A rail is a plain object with four attributes and six methods. No base class, no
+registration decorator, no import-time side effects. This is the whole of
+[`examples/memory_rail.py`](examples/memory_rail.py), the scripted rail every
+recipe above runs on:
+
+<!-- readme: skip -->
+```python
+class MemoryRail:
+    key = "memory:testnet/native:tok"            # must equal f"{network.key}/{asset.key}"
+    network = Network("memory", "testnet", True)
+    asset = Asset("native", "tok", "TOK", 2)
+    capabilities = frozenset({ADDRESS_VALIDATION, PAYMENT_REQUEST, OBSERVATION, SETTLEMENT})
+    binding_category = NOT_UNCONDITIONAL
+
+    def readiness(self, configuration): ...
+    def validate_recipient(self, recipient): ...
+    def capture_baseline(self, recipient, configuration): ...
+    def create_request(self, intent): ...
+    def observe(self, intent, configuration, previous=None): ...
+    def settle(self, intent, observations, claimed_transaction_ids=frozenset()): ...
+```
+
+`register()` validates the shape before your rail ever sees a sale — the key
+format, the identity types, the capability vocabulary, and that every method
+accepts both the initial and the resumed call shape. Runtime protocol checks
+alone only prove that method names exist:
+
+<!-- readme: raises -->
+```python
+registry.register(MemoryRail())          # DuplicateRail - it is already registered
+registry.get("no:such/rail:key")         # RailNotInstalled - the honest answer, not a stub
+```
+
+Three rules the protocol enforces and you should not fight:
+
+- **Declare capabilities honestly.** `conformance_issues` fails a plugin whose
+  `readiness` claims something `capabilities` did not declare, and a declared
+  capability that is neither ready nor explained is also a violation.
+- **Return immutable facts, never decisions about the host's business.** A rail
+  says "this transfer, this amount, this many confirmations". Whether that is
+  enough to ship the goods is the host's call.
+- **Never add a required field to a published protocol type.** Both
+  `RecipientBaseline.payment_component` and
+  `ObservationBatch.unresolved_transaction_ids` are optional with defaults for
+  this reason: a required field made every installed 0.1.0 wheel undriveable
+  while the source suite stayed green, because the suite tests the source and
+  the deployment runs the install.
+
+Ship it as its own distribution with an entry point, and installing it is what
+adds the rail — nothing in the host is edited:
+
+<!-- readme: skip -->
+```toml
+[project.entry-points."cryptopos.rails"]
+my-network-token = "my_rail:my_network_token"
+```
+
+## 9. Test your host with no chain, no funds, no network
+
+This is what `MemoryRail` is really for. Your host's bugs — the double-credit,
+the partial read, the late baseline — are all reachable without a chain, and
+they are the bugs that cost money.
+
+```python
+def scripted(*transfers, tip=100, page=1000):
+    return {"endpoint": "memory://", "tip": tip, "page": page,
+            "transfers": [dict(to="mem1alice", confs=3, **t) for t in transfers]}
+```
+
+**A payment that arrives in two parts settles once it is whole:**
+
+```python
+half = scripted({"id": "tx-1", "amount": 100, "height": 71},
+                {"id": "tx-2", "amount": 150, "height": 72}, tip=100)
+first = rail.capture_baseline("mem1alice", {"tip": 60})
+part = PaymentIntent("sale-2", rail.key, "mem1alice", 250, 1_787_100_000,
+                     1_787_101_800, baseline=first)
+rail.settle(part, rail.observe(part, half)).state        # -> 'settled'
+```
+
+**A bounded provider forces several reads, and the answer must not change:**
+
+```python
+paged = scripted({"id": "tx-1", "amount": 250, "height": 71}, tip=100, page=7)
+batch = rail.observe(part, paged)
+reads = 1
+while not batch.complete:
+    batch = rail.observe(part, paged, batch)
+    reads += 1
+reads > 1                                # -> True
+rail.settle(part, batch).state           # -> 'settled'
+```
+
+**A batch from another sale is refused rather than misapplied:**
+
+<!-- readme: raises -->
+```python
+rail.settle(intent, batch)               # InvalidRailPlugin - these observations belong to sale-2
+```
+
+That last refusal is the protocol catching a host bug for you: `require_intent`
+compares the rail, the intent id, the recipient, the provider and the baseline
+tip, so observations can never be applied to the wrong sale.
+
+---
+
+# Reference
+
 ## Capability, and what `chargeable` does not mean
 
 `chargeable=True` means a rail declares all four capabilities: it can validate a
@@ -44,104 +592,32 @@ decision. It does **not** mean the payment is bound to the sale. Read each rail
 package's binding section; they differ enormously, and the weakest is the
 default on four of the seven rails.
 
-Built around refusal at money boundaries: the calls that decide where funds go
-refuse rather than guess. See the [security model](#security-model) for exactly
-what is verified and what is not.
+`binding_category` is the rail's own declaration. `unconditional-per-sale` means
+the rail itself ties money to one sale before the host chooses any
+receiving-address strategy; `not-unconditional` means it does not, and the host
+must strengthen it (typically by deriving a fresh address per sale). Absence is
+read pessimistically as `not-unconditional`, so plugins published before the
+declaration existed stay driveable and understate their binding safely.
 
-The core is pure standard library with zero dependencies. Independently
-installed rail plugins may own transport dependencies the core should not
-force on every application.
+EVM readiness exercises the actual full-block or token-log method the rail
+needs, not only `eth_chainId`. It still cannot prove that a provider is honest.
+It is intentionally stricter than "a QR can be built".
 
-```bash
-pip install cryptopos-core
-```
+## Installable rails, and what core drives
 
-## Installable payment rails
-
-**Core drives no rails of its own.** `register_builtins()` registers the six
-*request-only* catalog entries — the chains this package can describe and build
-a payment request for, and cannot observe or settle. Every drivable rail is an
-installed package discovered through the `cryptopos.rails` entry-point group:
-`cryptopos-rail-bitcoin`, `cryptopos-rail-evm`, `cryptopos-rail-ootle`. Asking
-the registry for one without installing it raises `RailNotInstalled`, which is
-the honest answer rather than a stub.
-
-```bash
-pip install cryptopos-core cryptopos-rail-bitcoin
-```
+**Core drives no rails of its own.** `register_builtins()` registers six
+*request-only* catalogue entries — chains this package can describe and build a
+payment request for, and cannot observe or settle. Every drivable rail is an
+installed package discovered through the `cryptopos.rails` entry-point group.
+Asking the registry for one without installing it raises `RailNotInstalled`,
+which is the honest answer rather than a stub.
 
 ```python
-from cryptopos_core.plugin import PaymentIntent
 from cryptopos_core.registry import RailRegistry
 
-registry = RailRegistry()
-registry.register_builtins()   # six request-only catalog rails
-registry.discover()            # the installed rail packages, by entry point
-
-rail = registry.get("bitcoin:testnet4/native:btc")
-configuration = {"endpoint": "https://mempool.space/testnet4/api"}
-
-readiness = rail.readiness(configuration)
-if not readiness.chargeable:
-    raise RuntimeError(readiness.unavailable)
-
-# Capture provider facts before exposing the payment request. Bitcoin's
-# built-in rail also proves the address has no prior transaction history.
-baseline = rail.capture_baseline("tb1q...", configuration)
-intent = PaymentIntent(
-    intent_id="invoice-1042",
-    rail_key=rail.key,
-    recipient="tb1q...",
-    amount_native=125_000,
-    created_at_epoch=1_787_100_000,
-    expires_at_epoch=1_787_101_800,
-    baseline=baseline,
-)
-
-request = rail.create_request(intent)       # exact BIP-21 URI
-
-# Provider reads are bounded. EVM rails return a cumulative batch and resume
-# from it until the provider tip has been covered; Bitcoin completes in one read.
-observations = rail.observe(intent, configuration)
-while not observations.complete:
-    observations = rail.observe(intent, configuration, observations)
-
-decision = rail.settle(intent, observations, claimed_transaction_ids=frozenset())
-# Persist every credited ID atomically with the settlement decision.
-credited_transaction_ids = decision.transaction_ids
+catalogue = RailRegistry()
+len(catalogue.register_builtins())       # -> 6
 ```
-
-Pass only an incomplete batch back to `observe`. Once a batch is complete,
-start the next scheduled observation cycle without it so the rail revalidates
-the current canonical chain rather than carrying an old snapshot forward.
-
-Hosts own storage, scheduling, authorization, exchange-rate policy, and the
-invoice state machine. Plugins perform bounded operations and return immutable
-facts. Third-party packages register rails through the `cryptopos.rails`
-entry-point group; `RailRegistry.discover()` loads them explicitly, with no
-import-time network access.
-
-Private keys, transaction signing, refunds, payouts, custody, and treasury
-movement are outside this contract. They have a different threat model from
-receiving and proving a payment and should not become an extra capability on a
-merchant's read-only rail by accident.
-
-`readiness.chargeable` means all four charge capabilities passed their
-deployment checks. EVM readiness exercises the actual full-block or token-log
-method the rail needs, not only `eth_chainId`; it still cannot prove that a
-provider is honest. It is intentionally stricter than “a QR can be built.”
-`cryptopos_core.conformance.require_conformant()` checks that an installed
-plugin's capability and readiness claims agree before a host offers it.
-Registration also verifies that every operation accepts the protocol's initial
-and resumed call shapes; runtime protocol checks alone only prove that method
-names exist.
-
-### Catalogue scope
-
-**This table is the CATALOGUE, not what core drives.** Every row with a `yes`
-under observe or settle is served by a separate rail package; core alone can
-build the request and nothing else. The heading said "Built-in scope" until
-2026-08-31, which described the package as it was before the 2.0 split.
 
 | concrete network and asset | request | observe | settle | served by |
 |---|---:|---:|---:|---|
@@ -160,146 +636,40 @@ build the request and nothing else. The heading said "Built-in scope" until
 
 The six request-only rows are what `register_builtins()` returns. The six
 drivable rows are entry points, and **none of them is present until its package
-is installed**: verified by enumerating `cryptopos.rails` against an environment
-holding all four distributions.
-
-Per-rail boundaries — genesis-hash pinning, chain-ID verification, reorg
-exposure, and Ootle's two bindings — are in each rail package's own README,
-where they can be revised with the code they describe.
+is installed** — verified by enumerating `cryptopos.rails` against an
+environment holding all four distributions.
 
 This table is deliberately asymmetric. Breadth belongs in the registry;
 chargeability belongs in runtime readiness. Adding an asset never makes it
-settleable by implication.
+settleable by implication. Per-rail boundaries — genesis-hash pinning, chain-ID
+verification, reorg exposure, and Ootle's two bindings — are in each rail
+package's own README, where they can be revised with the code they describe.
 
-Bitcoin Testnet 4 is the network `cryptopos-rail-bitcoin` drives because [BIP 95's proposed
-Testnet 5](https://bips.dev/95/) is still a draft and does not yet define a
-genesis block. Bitcoin
-test-network addresses share an address format, and BIP-21 does not name the
-network, so the payer wallet must still be configured for Testnet 4 even though
-the observer independently verifies the [BIP 94 Testnet 4 genesis
-hash](https://bips.dev/94/).
+Bitcoin Testnet 4 is the network `cryptopos-rail-bitcoin` drives because
+[BIP 95's proposed Testnet 5](https://bips.dev/95/) is still a draft and does not
+yet define a genesis block. Bitcoin test-network addresses share an address
+format, and BIP-21 does not name the network, so the payer wallet must still be
+configured for Testnet 4 even though the observer independently verifies the
+[BIP 94 Testnet 4 genesis hash](https://bips.dev/94/). BIP 95 also documents the
+persistent short reorgs that motivated Testnet 5, so that rail's
+one-confirmation gate is a test-flow gate, not a model for accepting valuable
+Bitcoin payments.
 
-BIP 95 also documents the persistent short reorgs that motivated Testnet 5.
-The built-in one-confirmation gate is therefore a test-flow gate, not a model
-for accepting valuable Bitcoin payments. A host that treats test coins as
-valuable should require a deeper operator policy.
+What is **not** in the table: which endpoint an operator configured, and whether
+a rail is switched on. Those change per deployment and belong to whatever is
+hosting this.
 
-## What it does
+## Reading the policy tier
 
-```python
-from cryptopos_core import rails, rates, qr
+Optional, and it lives in `cryptopos-rail-ootle`. Reads need no account and cost
+nothing, which is the whole point: a merchant's promise is checkable by the
+customer holding the card, from any machine.
 
-# A rate is a number, a source, and a claim about how good the number is.
-microcents, source, ok = rates.quote("btc", "mainnet")
-#   -> (64001234000, "coinbase+kraken+bitstamp", True)  # $64,001.234
-# `ok` is False when this is a fallback rather than a quote -- it is never
-# dressed up as a feed answer. On mainnet a fallback is refused outright.
-
-# The amount to invoice. Guaranteed statable exactly in a payment URI.
-units = rails.invoice_amount(
-    rails.rail_for("btc"), usd_cents=1099, rate_microcents=microcents
-)
-
-# A payment URI as a module grid, not markup.
-grid = qr.modules_for(f"bitcoin:bc1q...?amount={units / 10**8:.8f}")
-#   -> {"size": 29, "quiet": 4, "rows": ["111111101101...", ...]}
-```
-
-`modules_for` returns the grid rather than an SVG on purpose. Hosts that
-sanitise stored HTML strip exactly the attributes an SVG needs — `d` and
-`fill` — leaving a well-formed and completely blank image. Send the bits and
-draw them at the surface.
-
-### Addresses — the last check before money moves
-
-An address that is wrong is money sent somewhere nobody holds a key to, and
-there is no step after that. So this is checksums, not pattern-matching:
-`^bc1[a-z0-9]{39}$` accepts a single-character typo that bech32 rejects.
-
-```python
-from cryptopos_core import addresses
-
-addresses.validate("btc", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "mainnet")
-#   -> ("ok", "")
-
-# The expensive mistake: valid, scannable, and money-losing.
-addresses.validate("btc", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "mainnet")
-#   -> ("refused", "that is a valid testnet address and this sale is mainnet;
-#                   paying it would send mainnet coin to a testnet key")
-```
-
-The verdict is three-valued — `ok`, `refused`, `unchecked` — and `unchecked`
-is not a soft `ok`. Solana addresses carry no checksum and Tari's format is
-unspecified, so claiming those were verified would make the verdict
-meaningless. `build_uri` refuses `unchecked` on mainnet.
-
-Bech32/Bech32m (BIP-173/350), Base58Check, EIP-55 and Monero's Keccak
-checksum, all against published vectors, all stdlib. Network binding works
-wherever the chain encodes one; EVM and Solana encode none, and the module
-says so rather than implying a check it did not perform.
-
-### Legacy rail metadata and amount math
-
-Twelve original rail definitions remain as frozen pure data—decimals, settle
-gate, historical maturity notes, and payment binding. New applications should
-use `catalog.BUILTIN_RAILS` and runtime readiness for capability decisions;
-the table remains the source for exact unit and URI math:
-
-```python
-from cryptopos_core import rails, uri
-
-rail = rails.rail_for("eth")
-rail["maturity"]        # "works" -- real testnet reads AND a real payer
-rail["gate_text"]       # "EIP-658 status == 0x1 AND confs >= 3"
-
-# Rounded ONCE at display precision, then scaled to native, so a small
-# amount does not round to zero on an 18-decimal chain.
-wei = rails.usd_cents_to_native(rail, usd_cents=625)   # 1785000000000000
-rails.format_amount(rail, wei)                          # "0.001785"
-
-address = "0x52908400098527886E0F7030069857D2E4169EE7"
-uri.build_uri("eth", {"address": address}, wei, mode="testnet")
-#   -> "ethereum:0x52908400098527886E0F7030069857D2E4169EE7@11155111?value=1785000000000000"
-```
-
-`maturity` is retained for compatibility with the original terminal. It is
-not the plugin readiness API and must not be used by a new host to enable a
-charge button.
-
-**Two amount forms live in `build_uri`, and the split is not cosmetic.**
-BIP-21, Solana Pay and ZIP-321 carry a decimal amount; ERC-681 and Tari's
-RFC-0154 deeplink carry the integer native amount. Sending the wrong one is
-not a rounding difference — it is off by 10¹⁸.
-
-`mode` is the sale's charge-time mode, so the chain id, token contract and
-network authority baked into the URI cannot change when an operator flips a
-setting mid-sale.
-
-The vocabulary is closed: `demo`, `testnet`, or `mainnet`. A typo is refused
-before a feed is called or a URI is built; it can never turn a misspelled
-mainnet sale into permissive demo behavior.
-
-**Use `rails.invoice_amount` to price a sale.** A decimal-amount URI carries
-the display form, which truncates — invoice a Solana sale through the
-lower-level `rates.native_for` and the QR asks for 73266000 lamports against
-an invoice of 73266666. The customer pays what they were shown and the sale
-sits 666 short of itself forever. `invoice_amount` cannot produce such an
-amount, and `build_uri` raises `AmountNotRepresentable` rather than emit one.
-
-What is **not** in the table: which endpoint an operator configured, and
-whether a rail is switched on. Those change per deployment and belong to
-whatever is hosting this.
-
-### Reading the policy tier
-
-Reads need no account and cost nothing, which is the whole point: a merchant's
-promise is checkable by the customer holding the card, from any machine.
-
+<!-- readme: skip -->
 ```python
 from cryptopos_rail_ootle.chain import OotleReader, ceilings_wording
 
 reader = OotleReader(loyalty_component="component_abc...")
-
 facts, reason = reader.promise()
 if facts is None:
     print(f"policy layer unavailable: {reason}")
@@ -308,22 +678,21 @@ else:
         print(heading, "--", body)
 ```
 
-**Every read is total. Nothing in `chain` raises.** A failed read returns
-`(None, reason)`, because the rule above that module is absolute: *a sale must
-never fail because the policy layer is down.* Check the sentinel; there is
-nothing to catch.
+**Every read is total. Nothing in that module raises.** A failed read returns
+`(None, reason)`, because the rule above it is absolute: *a sale must never fail
+because the policy layer is down.* Check the sentinel; there is nothing to
+catch.
 
 ## Why microcents
 
-Cents × 10⁴, i.e. USD × 10⁶. Integer cents build the error into the unit
-before any feed disagrees about anything: an asset quoted at $0.07745 is 7.745
-cents, which in integer cents is 8 — a 3.3% error on a cheap asset, which is
-exactly where a terminal handling more of them must be more precise, not less.
+Cents × 10⁴, i.e. USD × 10⁶. Integer cents build the error into the unit before
+any feed disagrees about anything: an asset quoted at $0.07745 is 7.745 cents,
+which in integer cents is 8 — a 3.3% error on a cheap asset, which is exactly
+where a terminal handling more of them must be more precise, not less.
 
 ## What raises, and what doesn't
 
-`chain` never raises — a failed policy read returns `(None, reason)`. Pricing
-and URI building do raise, and everything they raise subclasses
+Pricing and URI building raise; everything they raise subclasses
 `CryptoPosError`, so one `except` catches the lot:
 
 | Exception | When |
@@ -338,6 +707,9 @@ and URI building do raise, and everything they raise subclasses
 | `UnsupportedRail` | A rail is unknown or has no standardized payment URI |
 | `AddressRefused` | The receiving address failed its check, or is uncheckable on mainnet |
 | `AmountNotRepresentable` | The URI would have to truncate the invoiced amount |
+| `RailNotInstalled` | A rail key was asked for and no installed package provides it |
+| `DuplicateRail` | Two plugins claim the same rail key |
+| `InvalidRailPlugin` | A plugin, or a value handed to one, violates the protocol |
 
 They refuse to return a sentinel because there is no honest one — a caller
 handed `None` will either display it, multiply by it, or encode it into a QR,
@@ -345,9 +717,20 @@ and all three are worse than stopping. Catch these at your framework boundary
 and translate them into whatever your users see; the core does not know what a
 screen is.
 
-`FeedsDisagree` subclassing `RateUnavailable` is deliberate: a host that
-already catches the general error keeps refusing correctly without being
-changed. The safe behaviour is the one you get by doing nothing.
+`FeedsDisagree` subclassing `RateUnavailable` is deliberate: a host that already
+catches the general error keeps refusing correctly without being changed. The
+safe behaviour is the one you get by doing nothing.
+
+## Real money is held to stricter rules
+
+`quote(asset, "mainnet")` refuses to price from the demo constant, from a single
+uncorroborated feed, or when feeds disagree by more than 2%. All three raise
+`RateUnavailable` (or `FeedsDisagree`, which subclasses it), so a host already
+catching that keeps refusing correctly without being changed.
+
+`OotleReader` refuses a non-https indexer and refuses redirects that leave
+HTTPS. Its `promise()` facts carry the indexer that answered — the default is a
+**testnet** indexer, because no mainnet policy tier is published.
 
 ## What is deliberately not here
 
@@ -360,29 +743,23 @@ overrides, whether a rail is switched on, and the measured finality and
 watchability tables that decide whether a rail can be charged in a given mode.
 A library cannot confirm any of that without the host it came from.
 
-If you want those too, the reference host is the Frappe/ERPNext app this
-package was extracted from, which adds a Desk terminal, the `Crypto Sale`
-state machine, a chain watcher, and optional ERPNext Sales Invoice booking.
+Private keys, transaction signing, refunds, payouts, custody, and treasury
+movement are outside this contract. They have a different threat model from
+receiving and proving a payment, and should not become an extra capability on a
+merchant's read-only rail by accident.
 
-## Real money is held to stricter rules
-
-`quote(asset, "mainnet")` refuses to price from the demo constant, from a
-single uncorroborated feed, or when feeds disagree by more than 2%. All three
-raise `RateUnavailable` (or `FeedsDisagree`, which subclasses it), so a host
-already catching that keeps refusing correctly without being changed.
-
-`OotleReader` refuses a non-https indexer and refuses redirects that leave
-HTTPS. Its `promise()` facts carry the indexer that answered — the default
-is a **testnet** indexer, because no mainnet policy tier is published.
+If you want those too, the reference host is the Frappe/ERPNext app this package
+was extracted from, which adds a Desk terminal, the `Crypto Sale` state machine,
+a chain watcher, and optional ERPNext Sales Invoice booking.
 
 ## Security model
 
 Receiving addresses are checksum- and network-verified wherever their format
 makes that possible. An address is never claimed as checked when a rail carries
-no checksum or has no implemented format, and an unchecked address is refused
-on mainnet. URI amounts must state the invoice exactly; mainnet prices require
-at least two agreeing HTTPS feeds; network responses are size-bounded; and an
-HTTPS read may redirect only to another HTTPS URL.
+no checksum or has no implemented format, and an unchecked address is refused on
+mainnet. URI amounts must state the invoice exactly; mainnet prices require at
+least two agreeing HTTPS feeds; network responses are size-bounded; and an HTTPS
+read may redirect only to another HTTPS URL.
 
 These checks verify form, network, amount, and transport. They do **not** prove
 that the merchant controls a receiving key, that an external rate vendor is
@@ -396,19 +773,21 @@ Standard library only, no network, no framework, no test runner to install:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -t .
+python3 tools/readme.py --wheel     # every recipe above, against the wheel
 ```
 
-Every chain read is stubbed. A suite that needed a live indexer could not
-assert the thing that matters most here — what happens when the indexer is
-gone — so there is no network in it and there must never be one.
+Every chain read is stubbed. A suite that needed a live indexer could not assert
+the thing that matters most here — what happens when the indexer is gone — so
+there is no network in it and there must never be one.
 
 444 tests, no network, well under a second. Two installed-distribution checks
 skip from a source-only run and execute against the built wheel.
 
-Two of the tests are guards rather than tests of behaviour: one parses every
-module and fails if anything outside the standard library is imported, the
-other fails if the strings `frappe`, `erpnext` or `bench` appear anywhere in
-the package. Both claims on this README decay silently otherwise.
+Three of the checks are guards rather than tests of behaviour: one parses every
+module and fails if anything outside the standard library is imported, one fails
+if the strings `frappe`, `erpnext` or `bench` appear anywhere in the package,
+and `tools/readme.py` fails if any example in this file stopped being true. All
+three claims decay silently otherwise.
 
 ## Licence
 

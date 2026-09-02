@@ -21,17 +21,20 @@ sale's state machine. Those are where a host framework is genuinely better
 than a library, and a POS that hid them inside a package would be fighting
 whatever it was embedded in.
 
+Core drives no rails of its own. `register_builtins()` registers the six
+request-only catalogue entries; every drivable rail is a separately installed
+package found through the `cryptopos.rails` entry-point group:
+
     >>> from cryptopos_core.registry import RailRegistry
     >>> registry = RailRegistry()
     >>> len(registry.register_builtins())
-    12
+    6
+    >>> registry.discover()          # doctest: +SKIP
+    (<BitcoinTestnet4 ...>, ...)
 
-The chain reader takes its configuration at construction, so it reads the
-same chain from a till, a web backend, or a script with nothing under it:
-
-    >>> from cryptopos_core.chain import OotleReader
-    >>> reader = OotleReader(loyalty_component="component_abc...")
-    >>> facts, reason = reader.promise()
+The chain reader moved to `cryptopos-rail-ootle` in 2.0 and is imported from
+`cryptopos_rail_ootle.chain`. README.md is the cookbook; `tools/readme.py`
+checks every example in it against the built wheel.
 """
 
 from . import (
@@ -71,7 +74,7 @@ from .modes import VALID_MODES
 from .rails import RAILS, rail_for, rail_keys
 from .uri import build_uri
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 __all__ = [
 	"RAILS",

@@ -47,7 +47,13 @@ packages = ["src/cryptopos_core"]
 # source can run them; a user installing the wheel does not get a `tests`
 # package landing in their site-packages.
 [tool.hatch.build.targets.sdist]
-include = ["src/", "tests/", "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md"]
+# `examples/` and `tools/` ship because README.md links to them. A README
+# that points at files the distribution does not contain is the same defect
+# class as an example that is not true.
+include = [
+	"src/", "tests/", "examples/", "tools/",
+	"README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md",
+]
 
 [tool.ruff]
 line-length = 110
