@@ -592,38 +592,72 @@ DEMO_XPUB = ("xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZ
              "1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw")
 
 
-#: How to read the DESTINATION out of a payment URI, per network namespace.
-#: Substring containment is not verification: `memory:mem1attacker?note=
-#: mem1merchant` contains the merchant's address and pays the attacker. A rail
-#: whose scheme has no parser here gets a refusal rather than a guess, on the
-#: same principle as DERIVATIONS -- the alternative is accepting an instruction
-#: nobody read.
-URI_DESTINATIONS = {
-	"memory": lambda uri: uri.split(":", 1)[1].split("?", 1)[0],
-	"bitcoin": lambda uri: uri.split(":", 1)[1].split("?", 1)[0],
-	"ethereum": lambda uri: _evm_destination(uri),
-	"polygon": lambda uri: _evm_destination(uri),
-	"ootle": lambda uri: uri,
-}
+#: The chain id an ERC-681 URI must name, per EVM network. A URI that names
+#: another one tells the wallet to pay on a different chain entirely, and the
+#: destination address is identical on all of them.
+EVM_CHAIN_IDS = {("ethereum", "sepolia"): "11155111", ("polygon", "amoy"): "80002"}
+
+#: The URI scheme each namespace must use. `bitcoin:` and `ethereum:` addresses
+#: do not overlap, but nothing stops a defective rail emitting the wrong one.
+URI_SCHEMES = {"memory": "memory", "bitcoin": "bitcoin",
+               "ethereum": "ethereum", "polygon": "ethereum"}
 
 
-def _evm_destination(uri):
-	"""ERC-681: a native send targets the payee; a token send targets the
-	CONTRACT and carries the payee in `address=`."""
-	target = uri.split(":", 1)[1].split("@", 1)[0].split("?", 1)[0].split("/", 1)[0]
-	query = parse_qs(urlparse(uri).query)
-	return (query.get("address") or [target])[0]
+def _check_payment_identity(rail, intent, through, uri):
+	"""Refuse a URI that instructs anything but THIS payment.
 
+	A destination alone is not the payment. Checking only that let through
+	`bitcoin:` for a memory rail, `@1` for a Sepolia sale -- mainnet, where the
+	same address exists -- and a `transfer` call on some other token contract
+	while the observer watched the configured one. In each case the payer
+	follows one instruction and the sale watches another.
 
-def _uri_destination(namespace, uri):
-	reader = URI_DESTINATIONS.get(namespace)
-	if reader is None:
+	This covers the rails the example knows. A namespace it does not know is a
+	refusal, not a guess: an instruction nobody can read must not be shown to
+	a payer.
+	"""
+	namespace = rail.network.namespace
+	if namespace == "ootle":
+		# No registered scheme: the "URI" is the account or component itself.
+		if uri != through:
+			raise ValueError(f"the payment address is {uri!r}, not {through!r}")
+		return
+	if namespace not in URI_SCHEMES:
 		raise ValueError(f"no URI parser for the '{namespace}' namespace, so this payment "
 		                 f"instruction cannot be checked before it is shown to a payer")
-	try:
-		return reader(uri)
-	except (IndexError, ValueError):
-		raise ValueError(f"the payment URI {uri!r} could not be read") from None
+	scheme, _, rest = uri.partition(":")
+	if scheme != URI_SCHEMES[namespace]:
+		raise ValueError(f"the payment URI uses the {scheme!r} scheme, not "
+		                 f"{URI_SCHEMES[namespace]!r}")
+	target = rest.split("@", 1)[0].split("?", 1)[0].split("/", 1)[0]
+	query = parse_qs(urlparse(uri).query)
+
+	if namespace in ("ethereum", "polygon"):
+		wanted_chain = EVM_CHAIN_IDS.get((namespace, rail.network.reference))
+		named_chain = rest.split("@", 1)[1].split("?", 1)[0].split("/", 1)[0] if "@" in rest else ""
+		if wanted_chain is None:
+			raise ValueError(f"no chain id known for {rail.key}, so its URI cannot be checked")
+		if named_chain != wanted_chain:
+			raise ValueError(f"the payment URI names chain {named_chain or 'none'}, "
+			                 f"not {wanted_chain}")
+		if rail.asset.namespace == "erc20":
+			# The URI targets the CONTRACT and carries the payee as a parameter.
+			if target.lower() != rail.asset.reference.lower():
+				raise ValueError(f"the payment URI calls contract {target!r}, "
+				                 f"not {rail.asset.reference!r}")
+			if "/transfer" not in rest.split("?", 1)[0]:
+				raise ValueError("the payment URI does not call `transfer`")
+			paid = (query.get("address") or [""])[0]
+		else:
+			if query.get("address"):
+				raise ValueError("a native EVM payment URI must not carry an `address` parameter")
+			paid = target
+	else:
+		paid = target
+
+	if paid != through:
+		raise ValueError(f"the payment URI pays {paid!r}, not {through!r}. It is the "
+		                 f"instruction, and the fields beside it are not proof of it")
 
 
 def start_sale(amount_native):
@@ -675,11 +709,7 @@ def _open_sale(sale_id, amount_native, index, recipient):
 	# customer's money elsewhere. Where a rail pays THROUGH a component rather
 	# than to an address (Ootle), that component is what must appear.
 	through = baseline.payment_component or intent.recipient
-	destination = _uri_destination(RAIL.network.namespace, request.uri)
-	if destination != through:
-		raise ValueError(
-			f"the payment URI pays {destination!r}, not {through!r}. It is the instruction, "
-			f"and the fields beside it are not proof of it")
+	_check_payment_identity(RAIL, intent, through, request.uri)
 	sale = SALES.create({
 		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
@@ -716,17 +746,26 @@ def poll_once(sale, token):
 	while not batch.complete:
 		batch = RAIL.observe(intent, CONFIG, batch)
 
-	# CONFIRMED money makes this address used, whatever the sale decides next.
-	# Advancing only on a terminal decision left a confirmed part payment
-	# looking like an unused address, and the gap counter over-reported for
-	# good. "Any sighting" would be too generous the other way: an unconfirmed
-	# transfer can be replaced, so repeated ephemeral ones could walk the
-	# allocator past the wallet's recovery gap.
-	if any(transfer.confirmed for transfer in batch.transfers):
-		RECIPIENTS.paid(sale["index"])
+	# VALIDATE BEFORE ANY SIDE EFFECT. A batch built for another intent or
+	# baseline used to advance this address's durable high-water mark before
+	# `settle` rejected it, and the false checkpoint survived the restart.
+	# `settle` checks this too, so removing the line changes nothing today --
+	# it is here so that a future side effect placed above the settle call
+	# cannot silently reintroduce the same defect.
+	batch.require_intent(intent)
 
 	decision = RAIL.settle(intent, batch,
 	                       claimed_transaction_ids=SALES.claimed_at(sale["recipient"]))
+
+	# WHAT MAKES AN ADDRESS "USED" IS THE RAIL'S OWN MATURITY RULE, not one
+	# confirmation. `confirmed` means only `confirmations > 0`, so a single
+	# shallow block moved the high-water mark permanently and a reorg could
+	# not move it back -- hiding a later payment behind a longer unused run
+	# than the counter believed. Money the rail was willing to CREDIT has
+	# passed whatever depth that rail requires; a terminal decision that saw
+	# money has too.
+	if decision.credited_native or (decision.state != "pending" and decision.sighted_native):
+		RECIPIENTS.paid(sale["index"])
 	if decision.state == "pending":
 		# CARRY WHAT THE RAIL SAID. Overwriting `credited_native` with zero
 		# threw away a confirmed part payment: a rail can report pending with

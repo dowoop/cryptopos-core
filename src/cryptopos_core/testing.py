@@ -136,6 +136,10 @@ class MemoryRail:
 		                        0, (), None, unresolved)
 		return previous.extend(page) if previous else page
 
+	#: How deep a transfer must be before this rail will credit it. Overridden
+	#: per instance so a test can model a three-confirmation rail.
+	min_confirmations = 1
+
 	def settle(self, intent, observations, claimed_transaction_ids=frozenset()):
 		observations.require_intent(intent)
 		sighted = sum(t.amount_native for t in observations.transfers)
@@ -155,8 +159,13 @@ class MemoryRail:
 					f"scripted transfer {transfer.transaction_id!r} is confirmed but carries no "
 					f"'at' -- expiry is judged on when money arrived, and treating an unknown "
 					f"arrival as timely is how a late payment settles")
+		# A DEPTH GATE, like every real rail has. `min_confirmations` in the
+		# configuration lets a host model Sepolia's three or Bitcoin's one, and
+		# therefore the state that matters most: money confirmed on the chain
+		# and not yet deep enough for the rail to credit it.
+		depth = max(1, int(self.min_confirmations))
 		usable = [t for t in observations.transfers
-		          if t.confirmations >= 1 and t not in late
+		          if t.confirmations >= depth and t not in late
 		          and t.transaction_id not in claimed_transaction_ids]
 		credited = sum(t.amount_native for t in usable)
 		if observations.unresolved_transaction_ids:

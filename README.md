@@ -313,12 +313,14 @@ gives you `cryptopos_core.testing`, which every recipe here uses; clone the
 repository for the server.)
 
 **Four things the example cannot do for you, stated rather than implied.** The
-`PaymentRequest` fields beside a URI are metadata, not proof of it: the example
-*parses* the URI for the destination it pays and refuses one that pays anywhere
-but the sale's own address — substring containment is not enough, since a URI
-paying an attacker can mention the merchant in a note. Past the destination it
-trusts the rail to encode the amount honestly, and it refuses outright for a
-network whose scheme it has no parser for. A
+`PaymentRequest` fields beside a URI are metadata, not proof of it, so the
+example parses the URI and checks the whole payment identity: the scheme, the
+chain id, the token contract for an ERC-20 rail, and the address the money
+actually reaches. A destination check alone was not enough — a URI paying an
+attacker can mention the merchant in a note, and `@1` on a Sepolia sale sends
+the customer to mainnet, where the same address exists. What remains trusted is
+the **amount** the URI encodes, and a network whose scheme the example has no
+parser for is refused rather than shown to a payer. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state

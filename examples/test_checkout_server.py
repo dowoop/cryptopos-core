@@ -243,6 +243,48 @@ class TheGapLimitIsDefended(Harness):
 		finally:
 			app.UNPAID_RUN_LIMIT = original
 
+	def test_a_foreign_batch_does_not_mark_this_address_used(self):
+		"""A batch built for another intent used to advance this address's
+		durable high-water mark before settle rejected it, and the false
+		checkpoint survived a restart."""
+		mine = app.start_sale(100)
+		theirs = app.start_sale(100)
+		self.pay(theirs, 100, 71, "not-mine")
+		foreign = app.RAIL.observe(theirs["intent"], app.CONFIG)
+		before = app.RECIPIENTS._read_state()["highest_paid"]
+
+		# A defective or hostile rail hands back a batch built for the OTHER
+		# sale. It must be refused before anything durable moves.
+		app.RAIL.observe = lambda *a, **k: foreign
+		token = app.SALES.lease(mine["id"], int(time.time()))
+		with self.assertRaises(Exception):
+			app.poll_once(app.SALES.get(mine["id"]), token)
+		self.assertEqual(app.RECIPIENTS._read_state()["highest_paid"], before)
+
+	def test_a_shallow_confirmation_does_not_mark_the_address_used(self):
+		"""`confirmed` means only `confirmations > 0`. One shallow block moved
+		the durable high-water mark permanently, and a reorg could not move it
+		back -- hiding a later payment behind a longer unused run than the
+		counter believed. What counts is money the RAIL was willing to credit,
+		which is what passing its own depth gate means."""
+		app.RAIL.min_confirmations = 3
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 2
+		try:
+			first = app.start_sale(100)
+			app.CONFIG["tip"] = 100
+			app.CONFIG["transfers"].append({
+				"id": "one-block-deep", "to": first["recipient"], "amount": 100,
+				"confs": 1, "height": 71, "at": first["expires_at"] - 60})
+			result = self.poll(first)
+			self.assertEqual((result.state, result.sighted_native), ("pending", 100))
+			self.assertEqual(result.credited_native, 0)
+
+			app.start_sale(1)
+			with self.assertRaises(ValueError):
+				app.start_sale(1)       # index 0 is NOT yet a used address
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
 	def test_an_unconfirmed_sighting_does_not_mark_the_address_used(self):
 		"""An unconfirmed transfer can be replaced or dropped, so letting one
 		reset the counter would let repeated ephemeral transactions walk the
@@ -724,10 +766,71 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app.start_sale(100)
 
-	def test_a_scheme_with_no_parser_is_refused_not_guessed(self):
+	def test_a_namespace_with_no_parser_is_refused_not_guessed(self):
 		"""An instruction nobody can read must not be shown to a payer."""
+		class Exotic:
+			key = "newchain:testnet/native:new"
+			asset = app.RAIL.asset
+
+			class network:
+				namespace, reference, is_testnet = "newchain", "testnet", True
+
 		with self.assertRaises(ValueError):
-			app._uri_destination("some-new-chain", "newchain:abc?amount=1")
+			app._check_payment_identity(Exotic, None, "abc", "newchain:abc?amount=1")
+
+	def test_a_uri_with_the_wrong_scheme_is_refused(self):
+		"""bitcoin: and ethereum: addresses do not overlap, but nothing stops a
+		defective rail emitting the wrong scheme."""
+		original = app.RAIL.create_request
+
+		def wrong_scheme(intent):
+			request = original(intent)
+			return type(request)(request.rail_key,
+			                     f"bitcoin:{intent.recipient}?amount=100",
+			                     request.recipient, request.amount_native,
+			                     request.payer_notice)
+
+		app.RAIL.create_request = wrong_scheme
+		with self.assertRaises(ValueError):
+			app.start_sale(100)
+
+	def test_an_evm_uri_naming_another_chain_is_refused(self):
+		"""The same address exists on every EVM chain, so `@1` on a Sepolia
+		sale sends the customer to mainnet."""
+		class Sepolia:
+			key = "ethereum:sepolia/native:eth"
+
+			class network:
+				namespace, reference, is_testnet = "ethereum", "sepolia", True
+
+			class asset:
+				namespace, reference = "native", "eth"
+
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+		app._check_payment_identity(Sepolia, None, merchant,
+		                            f"ethereum:{merchant}@11155111?value=1")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(Sepolia, None, merchant,
+			                            f"ethereum:{merchant}@1?value=1")
+
+	def test_an_erc20_uri_calling_another_contract_is_refused(self):
+		class Usdc:
+			key = "polygon:amoy/erc20:0x41e9"
+
+			class network:
+				namespace, reference, is_testnet = "polygon", "amoy", True
+
+			class asset:
+				namespace, reference = "erc20", "0x41e94eb019c0762f9bfcf9fb1e58725bfb0e7582"
+
+		merchant = "0x4B7115aD9623A528f1845eaf85D166dE1E869BFB"
+		good = (f"ethereum:{Usdc.asset.reference}@80002/transfer"
+		        f"?address={merchant}&uint256=1")
+		app._check_payment_identity(Usdc, None, merchant, good)
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				Usdc, None, merchant,
+				f"ethereum:0xdeadbeef@80002/transfer?address={merchant}&uint256=1")
 
 	def test_a_duplicate_sale_id_is_refused(self):
 		sale = app.start_sale(100)

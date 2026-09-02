@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Eleven rounds of adversarial review of the cookbook, the reference example
-and the gate over both found eighty-three defects. Nothing in the payment protocol
+Twelve rounds of adversarial review of the cookbook, the reference example
+and the gate over both found eighty-five defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -266,6 +266,23 @@ and the checks that keep them honest.
     CONFIRMED money in the batch instead -- and only confirmed, since an
     unconfirmed transfer can be replaced and repeated ephemeral ones would
     otherwise walk the allocator past the wallet's recovery gap.
+* A twelfth round found two more, and again the first could divert a payment:
+  - **A destination is not a payment identity.** Parsing the URI for its payee
+    still accepted the wrong scheme, the wrong chain, and the wrong token
+    contract: `@1` on a Sepolia sale sends the customer to mainnet, where the
+    same address exists, and a `transfer` call on another contract moves an
+    asset the observer is not watching. The check now covers scheme, chain id,
+    ERC-20 contract and payee together, and the README no longer claims that
+    only the amount stays trusted.
+  - **One confirmation is not durability.** `confirmed` means only
+    `confirmations > 0`, so a single shallow block moved the allocator's
+    high-water mark permanently and a reorg could not move it back -- hiding a
+    later payment behind a longer unused run than the counter believed. The
+    mark advances on money the RAIL was willing to credit, which is what
+    passing its own depth gate means, and `MemoryRail` gained a
+    `min_confirmations` so a host can model a three-confirmation rail and test
+    exactly that state. The `paid()` call also moved below `settle`, so a
+    rejected batch can no longer leave a durable checkpoint behind.
 
 ## 2.1.1
 
