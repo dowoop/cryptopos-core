@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Fourteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found eighty-nine defects. Nothing in the payment protocol
+Fifteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found ninety defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -307,6 +307,14 @@ and the checks that keep them honest.
     `parse_qs` threw the order away. `?uint256=1&address=M&bytes32=..` passed
     while describing a different ABI call. The arguments must be exactly
     `address` then `uint256`.
+* A fifteenth round found one more, and anyone could have triggered it:
+  **late dust vetoed a paid sale.** `MemoryRail.settle` asked about late and
+  unreadable transfers before asking whether the invoice was already covered,
+  so one unit sent to a public receiving address after the window ended a
+  complete, timely, matured payment in `needs-review`, credited zero, claiming
+  no transaction. Settlement asks first whether timely, mature, unclaimed money
+  covers the invoice. The extra still needs reconciling; it does not unpay the
+  customer.
 
 ## 2.1.1
 

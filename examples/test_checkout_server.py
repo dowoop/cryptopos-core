@@ -190,6 +190,30 @@ class MoneyMustArriveInTime(Harness):
 		self.assertEqual(result.credited_native, 0)
 		self.assertEqual(result.sighted_native, 100)
 
+	def test_late_dust_cannot_veto_a_paid_sale(self):
+		"""Anyone who knows a public address can send one unit after the
+		window. Asking about late money before asking whether the customer has
+		paid let that dust end a complete, timely, matured payment in review,
+		claiming nothing."""
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "paid-in-time", at=sale["expires_at"] - 100)
+		self.pay(sale, 1, 120, "late-dust", at=sale["expires_at"] + 1)
+		result = self.poll(sale)
+		self.assertEqual(result.state, "settled")
+		self.assertEqual(result.credited_native, 100)
+		self.assertEqual(result.sighted_native, 101)
+		self.assertEqual(result.transaction_ids, ("paid-in-time",))
+
+	def test_an_unreadable_transfer_cannot_veto_a_paid_sale(self):
+		"""Same shape: an unrelated read failure beside a complete payment."""
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "paid-in-time", at=sale["expires_at"] - 100)
+		app.CONFIG["transfers"].append({
+			"id": "unreadable-dust", "to": sale["recipient"], "amount": 1,
+			"confs": 3, "height": 120, "at": sale["expires_at"] - 50,
+			"unreadable": True})
+		self.assertEqual(self.poll(sale).state, "settled")
+
 	def test_a_transfer_inside_the_window_is_credited(self):
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "in-time", at=sale["expires_at"] - 1)

@@ -173,23 +173,26 @@ class MemoryRail:
 		          if t not in late
 		          and t.transaction_id not in claimed_transaction_ids]
 		credited = sum(t.amount_native for t in usable)
+		# SETTLE FIRST WHEN THE INVOICE IS ALREADY COVERED. Asking about late or
+		# unreadable money before asking whether the customer has paid lets a
+		# single unit of dust, sent to a public address after the window, veto
+		# a complete and timely payment -- anyone can do it, and the sale ends
+		# terminally in review having claimed nothing. Money that arrived in
+		# time and matured is the customer's payment whatever else turns up
+		# beside it; the extra still needs reconciling, but not by unpaying
+		# them.
+		if credited >= intent.amount_native:
+			return SettlementDecision("settled", credited, sighted,
+			                          tuple(t.transaction_id for t in usable))
 		if observations.unresolved_transaction_ids:
 			# NOT A VERDICT, SO NOT TERMINAL. "I could not find out" is the
 			# absence of a decision; making it `needs-review` on the first
 			# failed read turns one transient provider hiccup into a sale a
-			# person has to rescue. It stays pending and is asked again -- and
-			# a host whose window has closed can then review it deliberately.
-			return SettlementDecision("pending", 0, sighted,
+			# person has to rescue. It stays pending and is asked again.
+			return SettlementDecision("pending", credited, sighted,
 			                          reason="a transaction could not be read yet")
 		if late:
-			return SettlementDecision("needs-review", 0, sighted,
+			return SettlementDecision("needs-review", credited, sighted,
 			                          reason="a transfer arrived after the payment window closed")
-		if credited >= intent.amount_native:
-			return SettlementDecision("settled", credited, sighted,
-			                          tuple(t.transaction_id for t in usable))
-		# A PENDING DECISION CAN STILL NAME CREDITABLE MONEY. A part payment is
-		# not nothing, and a host that shows the customer how much is
-		# outstanding needs the number. `SettlementDecision` allows it; only a
-		# SETTLED decision may claim transaction ids.
 		return SettlementDecision("pending", credited, sighted,
 		                          reason=f"{credited} of {intent.amount_native} seen")
