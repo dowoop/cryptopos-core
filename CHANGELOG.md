@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Ten rounds of adversarial review of the cookbook, the reference example and
-the gate over both found eighty defects. Nothing in the payment protocol
+Eleven rounds of adversarial review of the cookbook, the reference example
+and the gate over both found eighty-three defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -248,6 +248,24 @@ and the checks that keep them honest.
     ambiguity is refused rather than resolved. And the `- why` text after an
     exception name in a `raises` block is documented as a note for the reader
     rather than something the gate reads.
+* An eleventh round found three more, and the first could divert a payment:
+  - **Substring containment is not verification.** The URI check asked whether
+    the recipient appeared anywhere in the URI, so
+    `memory:mem1attacker?note=mem1merchant` passed and the QR paid the
+    attacker while the sale watched the merchant. The destination is parsed per
+    scheme now -- BIP-21 and ERC-681, including a token transfer's `address=`
+    parameter -- and a scheme with no parser is refused rather than guessed.
+  - **The fence was a convention, not an invariant.** `record`, `review` and
+    `expire` accepted a tokenless write whenever no lease happened to be
+    installed, so a host copying the README's worker loop -- which did not
+    lease at all -- reintroduced the race the lease was added to remove. The
+    token is required, and the cookbook's worker loop and SQL now show leasing,
+    fencing and release.
+  - `highest_paid` still did not advance for a pending part payment, because
+    the pending branch returns before any terminal write. It advances on
+    CONFIRMED money in the batch instead -- and only confirmed, since an
+    unconfirmed transfer can be replaced and repeated ephemeral ones would
+    otherwise walk the allocator past the wallet's recovery gap.
 
 ## 2.1.1
 

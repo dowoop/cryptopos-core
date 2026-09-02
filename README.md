@@ -314,8 +314,11 @@ repository for the server.)
 
 **Four things the example cannot do for you, stated rather than implied.** The
 `PaymentRequest` fields beside a URI are metadata, not proof of it: the example
-checks that the URI names the address (or component) the money must go through,
-and past that it trusts the rail to encode its own amount honestly. A
+*parses* the URI for the destination it pays and refuses one that pays anywhere
+but the sale's own address — substring containment is not enough, since a URI
+paying an attacker can mention the merchant in a note. Past the destination it
+trusts the rail to encode the amount honestly, and it refuses outright for a
+network whose scheme it has no parser for. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state
@@ -365,10 +368,13 @@ try:
         # carries NO transaction ids, so the PRIMARY KEY above cannot catch
         # it. Only `AND state = 'pending'` can.
         rows = db.execute(
-            "UPDATE sale SET state=?, credited=? WHERE id=? AND state='pending'",
-            (decision.state, decision.credited_native, sale_id)).rowcount
+            "UPDATE sale SET state=?, credited=? "
+            "WHERE id=? AND state='pending' AND lease=?",
+            (decision.state, decision.credited_native, sale_id, token)).rowcount
         if rows != 1:
-            raise AlreadyDecided(sale_id)      # abort; claim nothing
+            # Either another worker decided this sale, or this worker's lease
+            # expired and someone else owns it now. Either way: claim nothing.
+            raise AlreadyDecided(sale_id)
         db.executemany(
             "INSERT INTO credited_tx (rail_key, recipient, tx_id, sale_id) "
             "VALUES (?, ?, ?, ?)",
@@ -387,22 +393,42 @@ to a decision that claims nothing. And catching **the uniqueness violation
 specifically**, rather than every `IntegrityError`, is why an unrelated
 constraint failure is not silently misread as a lost claim race.
 
-**Let a provider error stay an error — and only a provider error.** A failed
-read is not a verdict; leave the sale pending and try again. But catching
-everything is worse than catching nothing:
+**One worker owns a sale from its observation to its write.** A conditional
+update is not enough on its own: two workers reading the chain a block apart
+reach different conclusions, and then the *first* writer wins rather than the
+better-informed one — a `needs-review` computed from a stale read beats a
+`settled` computed from a fresh one, and the paid sale never settles. Take a
+lease, carry its token into the write, and let the write refuse anyone who does
+not hold it:
 
 <!-- readme: skip -->
 ```python
 for sale in open_sales():
+    token = lease(sale.id, ttl=30)      # returns None if someone else holds it
+    if token is None:
+        continue
     try:
-        poll_once(sale)
+        poll_once(sale, token)          # observe AND write under this token
     except RailProviderError as exc:
         log.warning("watch %s: provider unavailable: %s", sale.id, exc)
     # An InvalidRailPlugin, an integrity violation, or a bug in your own code
     # repeats deterministically. Swallowing those retries them forever, and the
     # customer's money sits on-chain against a sale nobody is told about.
     # Let them raise, fail the job, and page someone.
+    finally:
+        release(sale.id, token)         # only if the token still matches
 ```
+
+The token is what makes it a lease rather than a hint. A worker whose provider
+read outlives its lease must not release the lease its successor now holds, and
+must not write through it — so `UPDATE ... WHERE id = ? AND state = 'pending'`
+gains `AND lease = ?`, and a release is `WHERE id = ? AND lease = ?`. Without
+that, a slow worker's stale conclusion still lands.
+
+**Let a provider error stay an error — and only a provider error.** A failed
+read is not a verdict; leave the sale pending and try again. Catching
+everything is worse than catching nothing, which is why the block above names
+one exception rather than `Exception`.
 
 FastAPI, Flask and Django change only the outermost layer: a route that calls
 `start_sale`, a route that returns the state as JSON, and a job in your existing

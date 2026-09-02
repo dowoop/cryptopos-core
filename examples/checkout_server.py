@@ -161,7 +161,7 @@ class Sales:
 			return frozenset(tx for (rail, at, tx) in self._credited
 			                 if (rail, at) == (RAIL.key, recipient))
 
-	def record(self, sale_id, decision, token=None):
+	def record(self, sale_id, decision, token):
 		"""Claim the transactions and write the state, or do neither.
 
 		Returns CLAIMED, CONFLICT (another sale owns one of these ids), or
@@ -173,7 +173,11 @@ class Sales:
 			sale = self._sales[sale_id]
 			if sale["state"] != "pending":
 				return ALREADY_DECIDED
-			if sale["lease"] is not None and not self._holds(sale, token):
+			# A TERMINAL WRITE REQUIRES THE LEASE, always. Accepting a
+			# tokenless write whenever no lease happened to be installed made
+			# the fence a convention that `_watch_one_pass` followed and a
+			# reader copying the worker loop did not.
+			if not self._holds(sale, token):
 				return ALREADY_DECIDED
 			mine = {(RAIL.key, sale["recipient"], tx) for tx in decision.transaction_ids}
 			if self._credited.intersection(mine):
@@ -186,12 +190,11 @@ class Sales:
 			self._credited.update(mine)                       # claimed with the write
 			return CLAIMED
 
-	def review(self, sale_id, result, token=None):
+	def review(self, sale_id, result, token):
 		"""Hand a sale to a person, with what was actually seen."""
 		with self._lock:
 			sale = self._sales[sale_id]
-			if sale["state"] != "pending" or (
-					sale["lease"] is not None and not self._holds(sale, token)):
+			if sale["state"] != "pending" or not self._holds(sale, token):
 				return False
 			sale["state"] = "needs-review"
 			sale["sighted_native"] = result.sighted_native
@@ -235,12 +238,12 @@ class Sales:
 			if sale is not None and self._holds(sale, token):
 				sale["leased_until"], sale["lease"] = 0, None
 
-	def expire(self, sale_id, now, token=None):
+	def expire(self, sale_id, now, token):
 		"""Stop watching a sale whose window closed with nothing in it."""
 		with self._lock:
 			sale = self._sales[sale_id]
-			if sale["state"] != "pending" or now < sale["expires_at"] or (
-					sale["lease"] is not None and not self._holds(sale, token)):
+			if (sale["state"] != "pending" or now < sale["expires_at"]
+					or not self._holds(sale, token)):
 				return False
 			sale["state"] = "expired"
 			sale["reason"] = "the payment window closed with nothing received"
@@ -589,6 +592,40 @@ DEMO_XPUB = ("xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZ
              "1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw")
 
 
+#: How to read the DESTINATION out of a payment URI, per network namespace.
+#: Substring containment is not verification: `memory:mem1attacker?note=
+#: mem1merchant` contains the merchant's address and pays the attacker. A rail
+#: whose scheme has no parser here gets a refusal rather than a guess, on the
+#: same principle as DERIVATIONS -- the alternative is accepting an instruction
+#: nobody read.
+URI_DESTINATIONS = {
+	"memory": lambda uri: uri.split(":", 1)[1].split("?", 1)[0],
+	"bitcoin": lambda uri: uri.split(":", 1)[1].split("?", 1)[0],
+	"ethereum": lambda uri: _evm_destination(uri),
+	"polygon": lambda uri: _evm_destination(uri),
+	"ootle": lambda uri: uri,
+}
+
+
+def _evm_destination(uri):
+	"""ERC-681: a native send targets the payee; a token send targets the
+	CONTRACT and carries the payee in `address=`."""
+	target = uri.split(":", 1)[1].split("@", 1)[0].split("?", 1)[0].split("/", 1)[0]
+	query = parse_qs(urlparse(uri).query)
+	return (query.get("address") or [target])[0]
+
+
+def _uri_destination(namespace, uri):
+	reader = URI_DESTINATIONS.get(namespace)
+	if reader is None:
+		raise ValueError(f"no URI parser for the '{namespace}' namespace, so this payment "
+		                 f"instruction cannot be checked before it is shown to a payer")
+	try:
+		return reader(uri)
+	except (IndexError, ValueError):
+		raise ValueError(f"the payment URI {uri!r} could not be read") from None
+
+
 def start_sale(amount_native):
 	if not HEALTH["watching"]:
 		raise Unhealthy(HEALTH["why"])
@@ -638,9 +675,11 @@ def _open_sale(sale_id, amount_native, index, recipient):
 	# customer's money elsewhere. Where a rail pays THROUGH a component rather
 	# than to an address (Ootle), that component is what must appear.
 	through = baseline.payment_component or intent.recipient
-	if through not in request.uri:
-		raise ValueError(f"the payment URI does not name {through!r}; "
-		                 f"it is the instruction, and the fields beside it are not proof of it")
+	destination = _uri_destination(RAIL.network.namespace, request.uri)
+	if destination != through:
+		raise ValueError(
+			f"the payment URI pays {destination!r}, not {through!r}. It is the instruction, "
+			f"and the fields beside it are not proof of it")
 	sale = SALES.create({
 		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
@@ -659,13 +698,14 @@ def _open_sale(sale_id, amount_native, index, recipient):
 		# the derived index is spent, which is the honest cost of having built
 		# the request at all.
 		SALES.review(sale_id, PollResult("pending", 0, 0, (), "the watcher stopped "
-		                                 "before this sale was shown to anyone"))
+		                                 "before this sale was shown to anyone"),
+		             SALES.lease(sale_id, int(time.time())))
 		raise Unhealthy(HEALTH["why"])
 	RECIPIENTS.commit(sale_id)
 	return sale
 
 
-def poll_once(sale, token=None):
+def poll_once(sale, token):
 	"""One full observation cycle for one sale, then a settlement decision."""
 	intent = sale["intent"]
 
@@ -675,6 +715,15 @@ def poll_once(sale, token=None):
 	batch = RAIL.observe(intent, CONFIG)
 	while not batch.complete:
 		batch = RAIL.observe(intent, CONFIG, batch)
+
+	# CONFIRMED money makes this address used, whatever the sale decides next.
+	# Advancing only on a terminal decision left a confirmed part payment
+	# looking like an unused address, and the gap counter over-reported for
+	# good. "Any sighting" would be too generous the other way: an unconfirmed
+	# transfer can be replaced, so repeated ephemeral ones could walk the
+	# allocator past the wallet's recovery gap.
+	if any(transfer.confirmed for transfer in batch.transfers):
+		RECIPIENTS.paid(sale["index"])
 
 	decision = RAIL.settle(intent, batch,
 	                       claimed_transaction_ids=SALES.claimed_at(sale["recipient"]))
@@ -687,11 +736,6 @@ def poll_once(sale, token=None):
 
 	outcome = SALES.record(sale["id"], decision, token)
 	if outcome == CLAIMED:
-		if decision.sighted_native:
-			# ANY money at this address makes it used for a wallet's purposes.
-			# Advancing only on `settled` left a part payment, a late one, or
-			# one under review looking like an unused address.
-			RECIPIENTS.paid(sale["index"])
 		RECIPIENTS.close(sale["id"])
 		return PollResult(decision.state, decision.credited_native, decision.sighted_native,
 		                  decision.transaction_ids, decision.reason)

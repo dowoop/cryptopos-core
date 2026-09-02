@@ -39,6 +39,15 @@ class Harness(unittest.TestCase):
 		self.addCleanup(os.environ.pop, "CRYPTOPOS_INIT", None)
 		app.RECIPIENTS = app.Recipients(app.RAIL, app.DEMO_XPUB, "")
 
+	def poll(self, sale):
+		"""Poll as a worker must: holding the sale's lease from the observation
+		through to the terminal write."""
+		token = app.SALES.lease(sale["id"], int(time.time()))
+		try:
+			return app.poll_once(sale, token)
+		finally:
+			app.SALES.release(sale["id"], token)
+
 	def pay(self, sale, amount, height, txid, at=None):
 		app.CONFIG["tip"] = max(app.CONFIG["tip"], height + 5)
 		app.CONFIG["transfers"].append({
@@ -59,7 +68,7 @@ class OneSaleOneCustomersMoney(Harness):
 		self.pay(first, 100, 75, "tx-for-first")
 		self.pay(second, 250, 95, "tx-for-second")
 
-		one, two = app.poll_once(first), app.poll_once(second)
+		one, two = self.poll(first), self.poll(second)
 		self.assertEqual((one.state, one.credited_native), ("settled", 100))
 		self.assertEqual((two.state, two.credited_native), ("settled", 250))
 
@@ -92,7 +101,7 @@ class NoSharedAddressWithoutRefusing(Harness):
 		"""
 		first = app.start_sale(100)
 		self.pay(first, 100, 70, "first-paid")
-		self.assertEqual(app.poll_once(first).state, "settled")
+		self.assertEqual(self.poll(first).state, "settled")
 
 		second = app.start_sale(100)
 		self.assertNotEqual(second["recipient"], first["recipient"])
@@ -100,7 +109,7 @@ class NoSharedAddressWithoutRefusing(Harness):
 
 		# The first customer pays the old QR again. It must reach nothing.
 		self.pay(first, 100, 100, "first-paid-again")
-		self.assertEqual(app.poll_once(second).state, "pending")
+		self.assertEqual(self.poll(second).state, "pending")
 
 	def test_the_high_water_mark_survives_a_restart(self):
 		"""Losing it restarts allocation at zero and hands a live address to
@@ -137,7 +146,7 @@ class OneTransferOneInvoice(Harness):
 
 		app.SALES.claimed_at = claimed_then_wait
 		out = {}
-		threads = [threading.Thread(target=lambda s=s: out.__setitem__(s["id"], app.poll_once(s)))
+		threads = [threading.Thread(target=lambda s=s: out.__setitem__(s["id"], self.poll(s)))
 		           for s in (first, second)]
 		for t in threads:
 			t.start()
@@ -159,10 +168,11 @@ class OneTransferOneInvoice(Harness):
 		"""
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 75, "tx-once")
-		self.assertEqual(app.poll_once(sale).state, "settled")
+		self.assertEqual(self.poll(sale).state, "settled")
 
 		late = SettlementDecision("needs-review", 0, 100, reason="a slower worker")
-		self.assertEqual(app.SALES.record(sale["id"], late), app.ALREADY_DECIDED)
+		token = app.SALES.lease(sale["id"], int(time.time()))
+		self.assertEqual(app.SALES.record(sale["id"], late, token), app.ALREADY_DECIDED)
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "settled")
 		self.assertEqual(app.SALES.get(sale["id"])["credited_native"], 100)
 
@@ -174,7 +184,7 @@ class MoneyMustArriveInTime(Harness):
 		deadline had passed settled anyway."""
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "too-late", at=sale["expires_at"] + 1)
-		result = app.poll_once(sale)
+		result = self.poll(sale)
 		self.assertEqual(result.state, "needs-review")
 		self.assertEqual(result.credited_native, 0)
 		self.assertEqual(result.sighted_native, 100)
@@ -182,7 +192,7 @@ class MoneyMustArriveInTime(Harness):
 	def test_a_transfer_inside_the_window_is_credited(self):
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "in-time", at=sale["expires_at"] - 1)
-		self.assertEqual(app.poll_once(sale).state, "settled")
+		self.assertEqual(self.poll(sale).state, "settled")
 
 
 class TheGapLimitIsDefended(Harness):
@@ -196,7 +206,7 @@ class TheGapLimitIsDefended(Harness):
 			for _ in range(2):
 				app.start_sale(1)
 			self.pay(first, 100, 71, "late-but-low")
-			self.assertEqual(app.poll_once(first).state, "settled")
+			self.assertEqual(self.poll(first).state, "settled")
 			# index 0 is paid; 1 and 2 are unused; one more reaches the limit.
 			app.start_sale(1)
 			with self.assertRaises(ValueError):
@@ -217,18 +227,37 @@ class TheGapLimitIsDefended(Harness):
 		finally:
 			app.UNPAID_RUN_LIMIT = original
 
-	def test_money_short_of_settlement_still_marks_the_address_used(self):
-		"""A part payment, a late one, or one under review all put money at
-		that address. Advancing only on `settled` left it looking unused, and
-		the backpressure counter then over-reported the gap."""
+	def test_a_confirmed_part_payment_marks_the_address_used(self):
+		"""The sale is still pending -- 50 of 100 -- but the address demonstrably
+		holds confirmed money, so it is not an unused address for a wallet
+		restore. Advancing only on a terminal decision left it looking unused
+		and the gap counter over-reported for good."""
 		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
 		try:
 			first = app.start_sale(100)
-			self.pay(first, 100, 71, "arrived-late", at=first["expires_at"] + 1)
-			self.assertEqual(app.poll_once(first).state, "needs-review")
+			self.pay(first, 50, 71, "half-of-it")
+			self.assertEqual(self.poll(first).state, "pending")
 			for _ in range(2):
 				app.start_sale(1)
 			self.assertIsNotNone(app.start_sale(1))    # index 0 counts as used
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
+	def test_an_unconfirmed_sighting_does_not_mark_the_address_used(self):
+		"""An unconfirmed transfer can be replaced or dropped, so letting one
+		reset the counter would let repeated ephemeral transactions walk the
+		allocator past the wallet's recovery gap."""
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 2
+		try:
+			first = app.start_sale(100)
+			app.CONFIG["tip"] = 100
+			app.CONFIG["transfers"].append({
+				"id": "in-the-mempool", "to": first["recipient"], "amount": 100,
+				"confs": 0, "height": 71, "at": first["expires_at"] - 60})
+			self.assertEqual(self.poll(first).state, "pending")
+			app.start_sale(1)
+			with self.assertRaises(ValueError):
+				app.start_sale(1)
 		finally:
 			app.UNPAID_RUN_LIMIT = original
 
@@ -239,7 +268,7 @@ class TheGapLimitIsDefended(Harness):
 				app.start_sale(1)
 			paid = app.start_sale(100)
 			self.pay(paid, 100, 71, "a-real-payment")
-			self.assertEqual(app.poll_once(paid).state, "settled")
+			self.assertEqual(self.poll(paid).state, "settled")
 			self.assertIsNotNone(app.start_sale(1))     # nothing after it is unused
 		finally:
 			app.UNPAID_RUN_LIMIT = original
@@ -265,7 +294,7 @@ class TheDoubleModelsRealChainStates(Harness):
 		app.CONFIG["transfers"].append({
 			"id": "in-the-mempool", "to": sale["recipient"], "amount": 250,
 			"confs": 0, "height": 71, "at": sale["expires_at"] - 60})
-		result = app.poll_once(sale)
+		result = self.poll(sale)
 		self.assertEqual(result.state, "pending")
 		self.assertEqual(result.sighted_native, 250)
 		self.assertEqual(result.credited_native, 0)
@@ -329,13 +358,15 @@ class TheWindowCloses(Harness):
 		"""A sale nobody paid must leave `open_sales()`, or in shared mode it
 		blocks every later sale and in derived mode it is watched forever."""
 		sale = app.start_sale(100)
-		self.assertTrue(app.SALES.expire(sale["id"], sale["expires_at"] + 1))
+		token = app.SALES.lease(sale["id"], int(time.time()))
+		self.assertTrue(app.SALES.expire(sale["id"], sale["expires_at"] + 1, token))
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "expired")
 		self.assertEqual(app.SALES.open_sales(), [])
 
 	def test_a_live_sale_does_not_expire_early(self):
 		sale = app.start_sale(100)
-		self.assertFalse(app.SALES.expire(sale["id"], sale["expires_at"] - 1))
+		token = app.SALES.lease(sale["id"], int(time.time()))
+		self.assertFalse(app.SALES.expire(sale["id"], sale["expires_at"] - 1, token))
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
 
 
@@ -447,7 +478,7 @@ class SharedAddressIsSingleUse(Harness):
 		app.RECIPIENTS = self._static()
 		first = app.start_sale(100)
 		self.pay(first, 100, 70, "first-paid")
-		self.assertEqual(app.poll_once(first).state, "settled")
+		self.assertEqual(self.poll(first).state, "settled")
 		with self.assertRaises(ValueError):
 			app.start_sale(100)
 
@@ -479,7 +510,7 @@ class OneTransactionCanPayTwoSales(Harness):
 		self.pay(first, 100, 71, "one-batched-payout")
 		self.pay(second, 250, 71, "one-batched-payout")
 
-		one, two = app.poll_once(first), app.poll_once(second)
+		one, two = self.poll(first), self.poll(second)
 		self.assertEqual((one.state, one.credited_native), ("settled", 100))
 		self.assertEqual((two.state, two.credited_native), ("settled", 250))
 
@@ -487,7 +518,7 @@ class OneTransactionCanPayTwoSales(Harness):
 		"""Scoping by recipient must not weaken the replay guard."""
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "paid-once")
-		self.assertEqual(app.poll_once(sale).state, "settled")
+		self.assertEqual(self.poll(sale).state, "settled")
 		self.assertEqual(app.SALES.claimed_at(sale["recipient"]), frozenset({"paid-once"}))
 
 
@@ -597,7 +628,7 @@ class ArrivalTimeIsNotOptional(Harness):
 			"id": "no-time", "to": sale["recipient"], "amount": 100,
 			"confs": 3, "height": 71})            # deliberately no "at"
 		with self.assertRaises(Exception):
-			app.poll_once(sale)
+			self.poll(sale)
 
 
 class OneWorkerOwnsASale(Harness):
@@ -618,6 +649,12 @@ class OneWorkerOwnsASale(Harness):
 		self.assertEqual(
 			app.SALES.record(sale["id"], SettlementDecision("needs-review", 0, 0), "stale"),
 			app.ALREADY_DECIDED)
+
+		# review() and expire() are fenced too, not only record().
+		self.assertFalse(app.SALES.review(
+			sale["id"], app.PollResult("pending", 0, 1, (), "stale"), "stale"))
+		self.assertFalse(app.SALES.expire(sale["id"], sale["expires_at"] + 1, "stale"))
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
 
 		app.SALES.release(sale["id"], token)
 		self.assertIsNotNone(app.SALES.lease(sale["id"], now))
@@ -655,6 +692,22 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app.start_sale(100)
 
+	def test_a_uri_that_merely_MENTIONS_the_address_is_refused(self):
+		"""Substring containment is not verification: a URI paying an attacker
+		while naming the merchant in a note passed, and the QR pays the URI."""
+		original = app.RAIL.create_request
+
+		def decoy(intent):
+			request = original(intent)
+			return type(request)(
+				request.rail_key,
+				f"memory:mem1attacker?note={intent.recipient}&amount=100",
+				request.recipient, request.amount_native, request.payer_notice)
+
+		app.RAIL.create_request = decoy
+		with self.assertRaises(ValueError):
+			app.start_sale(100)
+
 	def test_a_uri_naming_another_address_is_refused(self):
 		"""The three fields beside a URI are metadata, not proof of it: a
 		request naming the right recipient while its URI names another address
@@ -671,6 +724,11 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app.start_sale(100)
 
+	def test_a_scheme_with_no_parser_is_refused_not_guessed(self):
+		"""An instruction nobody can read must not be shown to a payer."""
+		with self.assertRaises(ValueError):
+			app._uri_destination("some-new-chain", "newchain:abc?amount=1")
+
 	def test_a_duplicate_sale_id_is_refused(self):
 		sale = app.start_sale(100)
 		with self.assertRaises(ValueError):
@@ -685,7 +743,7 @@ class LateWorkersGetTheTruth(Harness):
 		# address, and not this sale's to take. (An unreadable one is not --
 		# that stays pending, because it is the absence of an answer.)
 		self.pay(sale, 250, 71, "arrived-late", at=sale["expires_at"] + 1)
-		self.assertEqual(app.poll_once(sale).state, "needs-review")
+		self.assertEqual(self.poll(sale).state, "needs-review")
 
 		late = app._stored_decision(sale["id"])
 		self.assertEqual(late.state, "needs-review")
