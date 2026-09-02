@@ -38,6 +38,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, parse_qsl, urlparse
 
@@ -637,6 +638,41 @@ URI_SCHEMES = {"memory": "memory", "bitcoin": "bitcoin",
                "ethereum": "ethereum", "polygon": "ethereum"}
 
 
+#: Which parameter carries the amount, and whether it is the integer native
+#: amount or a decimal one. BIP-21 and its relatives carry decimals; ERC-681
+#: carries integers, and confusing the two is off by 10**18.
+AMOUNT_PARAMETERS = {"memory": ("amount", "native"), "bitcoin": ("amount", "decimal"),
+                     "ethereum": ("value", "native"), "polygon": ("value", "native")}
+
+
+def _check_amount(rail, uri, arguments, wanted):
+	"""Refuse a URI that asks the payer for anything but the invoiced amount.
+
+	This was the last field left on trust, and it did not need to be: every
+	scheme here states the amount, and the intent says what it should be. A
+	rail that encoded a different number -- or none -- would have the customer
+	pay something the sale never asked for, and an underpayment then sits in
+	review while an overpayment is the customer's loss.
+	"""
+	if rail.asset.namespace == "erc20":
+		name, kind = "uint256", "native"
+	else:
+		name, kind = AMOUNT_PARAMETERS[rail.network.namespace]
+	stated = [value for key, value in arguments if key == name]
+	if len(stated) != 1:
+		raise ValueError(f"the payment URI states the amount {len(stated)} times in `{name}`; "
+		                 f"exactly once is the invoice")
+	try:
+		if kind == "native":
+			asked = int(stated[0])
+		else:
+			asked = int(Decimal(stated[0]).scaleb(rail.asset.decimals))
+	except (ArithmeticError, ValueError):
+		raise ValueError(f"the payment URI's amount {stated[0]!r} is not a number") from None
+	if asked != wanted:
+		raise ValueError(f"the payment URI asks for {asked}, and the invoice is {wanted}")
+
+
 def _check_payment_identity(rail, intent, through, uri):
 	"""Refuse a URI that instructs anything but THIS payment.
 
@@ -724,6 +760,8 @@ def _check_payment_identity(rail, intent, through, uri):
 	if paid != through:
 		raise ValueError(f"the payment URI pays {paid!r}, not {through!r}. It is the "
 		                 f"instruction, and the fields beside it are not proof of it")
+	if intent is not None:
+		_check_amount(rail, uri, arguments, intent.amount_native)
 
 
 def start_sale(amount_native):

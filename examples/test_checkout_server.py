@@ -901,6 +901,68 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 					f"ethereum:{self._usdc().asset.reference}@80002/{function}"
 					f"?address={merchant}&uint256=1")
 
+	def test_a_uri_asking_for_the_wrong_amount_is_refused(self):
+		"""The last field that was taken on trust, and it did not need to be:
+		every scheme here states the amount and the intent says what it should
+		be. An underpayment sits in review; an overpayment is the customer's
+		loss, and neither is the sale's to cause."""
+		original = app.RAIL.create_request
+
+		def wrong_amount(intent):
+			request = original(intent)
+			return type(request)(request.rail_key,
+			                     f"memory:{intent.recipient}?amount=1",
+			                     request.recipient, request.amount_native,
+			                     request.payer_notice)
+
+		app.RAIL.create_request = wrong_amount
+		with self.assertRaises(ValueError):
+			app.start_sale(100)
+
+	def test_a_uri_stating_the_amount_twice_is_refused(self):
+		"""Which one the wallet reads is not the host's decision to leave open."""
+		class Btc:
+			key = "bitcoin:testnet4/native:btc"
+
+			class network:
+				namespace, reference, is_testnet = "bitcoin", "testnet4", True
+
+			class asset:
+				namespace, reference, decimals = "native", "btc", 8
+
+		class Intent:
+			amount_native = 125_000
+
+		address = "tb1qp5wfcq48h6d63wyy9qz0awtpfqwwv4smhppgv3"
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(
+				Btc, Intent, address,
+				f"bitcoin:{address}?amount=0.00125000&amount=9.99")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(Btc, Intent, address, f"bitcoin:{address}")
+
+	def test_a_bitcoin_uri_amount_is_read_as_a_decimal(self):
+		"""BIP-21 states a decimal amount; ERC-681 states an integer. Reading
+		one as the other is off by a factor of 10**decimals."""
+		class Btc:
+			key = "bitcoin:testnet4/native:btc"
+
+			class network:
+				namespace, reference, is_testnet = "bitcoin", "testnet4", True
+
+			class asset:
+				namespace, reference, decimals = "native", "btc", 8
+
+		class Intent:
+			amount_native = 125_000
+
+		address = "tb1qp5wfcq48h6d63wyy9qz0awtpfqwwv4smhppgv3"
+		app._check_payment_identity(Btc, Intent, address,
+		                            f"bitcoin:{address}?amount=0.00125000")
+		with self.assertRaises(ValueError):
+			app._check_payment_identity(Btc, Intent, address,
+			                            f"bitcoin:{address}?amount=0.00125001")
+
 	def test_an_evm_uri_suggesting_a_fee_is_refused(self):
 		"""ERC-681 lets a URI suggest gasPrice and gasLimit, and a wallet that
 		honours them will. A one-wei invoice can cost the customer twenty-one

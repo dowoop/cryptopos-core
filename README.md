@@ -321,15 +321,17 @@ example parses the URI and checks the whole payment identity: the scheme, the
 chain id, the token contract for an ERC-20 rail, and the address the money
 actually reaches. A destination check alone was not enough — a URI paying an
 attacker can mention the merchant in a note, and `@1` on a Sepolia sale sends
-the customer to mainnet, where the same address exists. Query parameters are
-whitelisted rather than ignored, because some of them are not decoration.
+the customer to mainnet, where the same address exists. The amount is
+checked against the invoice too — in the decimal form BIP-21 uses and the
+integer form ERC-681 uses, which differ by a factor of 10^decimals — so nothing
+about the instruction is left on trust. Query parameters are whitelisted rather
+than ignored, because some of them are not decoration.
 BIP-72's `r` tells a capable wallet to disregard the address entirely and fetch
 a payment request from a URL, which may name any output and need not be signed;
 ERC-681's `gasPrice` and `gasLimit` are fee *instructions*, and a one-wei
 invoice carrying them can cost the payer twenty-one ETH in fees while the sale
-settles perfectly. Both are refused — a wallet can estimate its own fee. What remains trusted is the **amount** the URI
-encodes, and a network whose scheme the example has no parser for is refused
-rather than shown to a payer. A
+settles perfectly. Both are refused — a wallet can estimate its own fee. A network whose scheme
+the example has no parser for is refused rather than shown to a payer. A
 BIP-32 key does not carry its own path, so nothing can tell an account key from
 another branch at the same depth — refusing a master key removes the only case
 that is provable, and the rest is yours to get right. A restored *older* state
@@ -1031,6 +1033,71 @@ merchant's read-only rail by accident.
 If you want those too, the reference host is the Frappe/ERPNext app this package
 was extracted from, which adds a Desk terminal, the `Crypto Sale` state machine,
 a chain watcher, and optional ERPNext Sales Invoice booking.
+
+## What is still assumed
+
+Nineteen rounds of adversarial review went into the cookbook, the reference
+example and the checks over both; ninety-seven findings reproduced and were
+fixed. What follows is what survived — the boundary, stated so that a reader
+knows where their own work begins. It is not a list of things nobody has
+thought about; it is the list of things that cannot be settled from inside a
+read-only receiving library.
+
+**Installed rail code is trusted code.** Entry-point discovery imports plugins
+into your process. Conformance checks their structure and the shape of what
+they return; it does not sandbox them and cannot prove their observations
+honest.
+
+**The provider is trusted to be complete and available.** Genesis-hash and
+chain-id checks stop a wrong-network configuration. They do not stop a
+correctly identified indexer from omitting history, stalling, or returning
+consistent lies.
+
+**Finality is a policy, not a proof.** Confirmation depths and finalized tags
+bound reorg exposure; they do not make a transaction irreversible. The depths
+documented here are test-flow policies, not mainnet advice.
+
+**The merchant is trusted to control the keys.** Address validation proves
+format and sometimes network, never ownership — and a BIP-32 public key cannot
+prove its own derivation path, so the operator owns the choice of account
+branch and the wallet's gap limit.
+
+**Allocator state is trusted to be durable and never rolled back.** The
+identity fingerprint catches a different key, rail or mode. It cannot tell the
+current file from an older valid copy of itself.
+
+**Every sale is assumed to have an address of its own, used once.** Where a
+rail has no unconditional per-sale binding, sequential reuse is unsafe too: an
+old instruction stays payable, so a shared recipient may back one sale for its
+entire lifetime.
+
+**The payer's wallet is trusted to follow the network it was told.** BIP-21
+does not encode Testnet 4 and Solana Pay does not encode a cluster. Receiving
+funds proves payment against an instruction — never who the payer was.
+
+**Your host is assumed to supply durable, atomic storage and real concurrency
+control.** Sales, baselines, leases, claims and outcomes must survive a
+restart; claiming `(rail, recipient, transaction_id)` and writing the terminal
+state must be one transaction; writes and releases must carry the current
+fencing token.
+
+**Clocks and timestamps are trusted enough for expiry policy.** The window and
+the maturation grace are yours. Late payments, part payments, overpayments and
+refunds need a staffed workflow: the example never reuses a late-payment
+address, and it never goes back for the money either.
+
+**The example server is not production infrastructure.** Its sales, claims,
+leases and review queue are in memory and a restart loses them. It has no
+authentication, no operator workflow, and no database, and its allocator
+assumes POSIX locking and a trustworthy filesystem.
+
+**Custody stays outside.** Keys, signing, refunds, payouts, treasury movement
+and incident response are not what a watch-only receiving rail is for.
+
+**The gates prove what they execute.** Deterministic checked examples, in the
+documented order and environment; `raises` blocks check exception classes;
+skipped blocks are syntax-checked only. Prose, live networks, provider honesty
+and production concurrency are outside them. This is evidence, not an audit.
 
 ## Security model
 

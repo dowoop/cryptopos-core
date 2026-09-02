@@ -3,7 +3,9 @@
 ## 2.2.0
 
 Nineteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-five defects. Nothing in the payment protocol
+and the gate over both found ninety-seven defects, after which the adversary
+reported convergence. What it could not close is published as a trust boundary
+in README.md rather than left implied. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -341,6 +343,11 @@ and the checks that keep them honest.
   separates established-but-not-creditable money from an unresolved read, and
   says that routing persistent uncertainty to a person is the host's grace
   policy rather than the rail's verdict.
+* The last field the example took on trust was the URI's amount, and it did not
+  need to be: every scheme states it and the intent says what it should be. It
+  is checked in both forms -- BIP-21's decimal and ERC-681's integer, which
+  differ by 10**decimals -- exactly once, so a rail cannot ask the customer for
+  a number the sale never invoiced.
 
 ## 2.1.1
 
