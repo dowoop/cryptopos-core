@@ -26,7 +26,7 @@ complete checkout — form, QR, polling, settlement — in one stdlib file you c
 run right now with no chain, no funds, and no configuration:
 
 ```bash
-python3 examples/checkout_server.py     # http://127.0.0.1:8099
+CRYPTOPOS_INIT=1 python3 examples/checkout_server.py     # http://127.0.0.1:8099
 ```
 
 ## Status — read this before you take money with it
@@ -97,13 +97,22 @@ project real money at least once:
    that was shown to a payer can still be paid, so a finished sale's QR settles
    whatever sale holds that address next. Derive an address per sale, allocate
    each one once, and never reissue it.
-2. **Claim `decision.transaction_ids` exclusively, in the same write as the
-   settled state.** `settle` is pure: it credits whatever you did not tell it
-   was already spent. Reading the claimed set, settling, then writing is the
-   obvious shape and it is wrong — two workers read the same set before either
-   writes, and one transfer settles two invoices. What saves you is that
-   claiming an id can *fail*: a `PRIMARY KEY` on the credited transaction id,
-   and the losing `INSERT` rolling back the sale state with it.
+2. **Claim `decision.transaction_ids` exclusively — per recipient — in the
+   same write as the settled state.** `settle` is pure: it credits whatever you
+   did not tell it was already spent. Reading the claimed set, settling, then
+   writing is the obvious shape and it is wrong — two workers read the same set
+   before either writes, and one transfer settles two invoices. What saves you
+   is that claiming can *fail*: a `PRIMARY KEY` over the claim, and the losing
+   `INSERT` rolling back the sale state with it.
+   **Key it on `(recipient, transaction_id)`, not the id alone.** A transaction
+   id is not an exclusive payment identifier: one chain transaction can carry
+   outputs to several addresses, so an exchange batching its withdrawals pays
+   two of your sales at once. Claiming the bare id settles the first and leaves
+   the second — whose customer really paid — looking unpaid. Reproduced against
+   the example here. Scoping by recipient is exact precisely *because* of
+   obligation 1: two sales never share an address, so they never share a
+   (recipient, transaction) pair, while the same output still cannot be
+   credited twice to the sale that owns that address.
 3. **Capture the baseline before the payer sees the request.** It pins the
    chain position the sale starts from. Capture it late and a transfer that
    predates the sale can be credited to it.
@@ -187,7 +196,7 @@ len(batch.transfers)                     # -> 1
 ```
 
 Then decide. `claimed_transaction_ids` is every transaction id your database has
-already credited to *any* sale (point 2):
+already credited **at this sale's recipient** — not across all sales (point 2):
 
 ```python
 decision = rail.settle(intent, batch, claimed_transaction_ids=frozenset())
@@ -207,6 +216,45 @@ replay.state                             # -> 'pending'
 
 Without it, one transfer settles two invoices.
 
+**And the scope of that set matters as much as its contents.** One chain
+transaction can pay several addresses at once — an exchange batching its
+withdrawals does exactly that — so a claim recorded against the bare
+transaction id would refuse the *other* sale it legitimately paid:
+
+```python
+alice, bob = "mem1alice", "mem1bob"
+batched = {**chain, "tip": 140, "transfers": [
+    {"id": "batch-1", "to": alice, "amount": 250, "confs": 3, "height": 120},
+    {"id": "batch-1", "to": bob, "amount": 400, "confs": 3, "height": 120},
+]}
+
+def sale_at(name, recipient, amount):
+    opened = rail.capture_baseline(recipient, {"tip": 100})
+    return PaymentIntent(name, rail.key, recipient, amount,
+                         1_787_100_000, 1_787_101_800, baseline=opened)
+
+for_alice, for_bob = sale_at("sale-x", alice, 250), sale_at("sale-y", bob, 400)
+first = rail.settle(for_alice, rail.observe(for_alice, batched), frozenset())
+first.state                              # -> 'settled'
+```
+
+Alice's sale has now credited `batch-1`. Pass that id to Bob's settlement as if
+it were globally spent and Bob — who was paid, in the same transaction — goes
+unpaid:
+
+```python
+rail.settle(for_bob, rail.observe(for_bob, batched), frozenset({"batch-1"})).state
+#   -> 'pending'
+```
+
+Scope the set to the recipient and both settle, because two sales never share
+an address:
+
+```python
+rail.settle(for_bob, rail.observe(for_bob, batched), frozenset()).state
+#   -> 'settled'
+```
+
 ## 2. Put it behind a web page
 
 [`examples/checkout_server.py`](examples/checkout_server.py) is a complete
@@ -216,11 +264,16 @@ the only framework-shaped code in a crypto checkout is "read a request, write a
 response" — the rest is the five calls.
 
 ```bash
-python3 examples/checkout_server.py
-# rail memory:testnet/native:tok -> mem1alice
+CRYPTOPOS_INIT=1 python3 examples/checkout_server.py
+# rail memory:testnet/native:tok -- a derived address per sale
 # demo rail: a scripted payer settles each sale about 8s after you charge it
-# http://127.0.0.1:8099
+# http://127.0.0.1:8099        (review queue: /review)
 ```
+
+`CRYPTOPOS_INIT=1` is needed once, to create the file that remembers which
+derivation indices have been handed out. After that its absence is a symptom
+rather than a fresh start, and the server refuses rather than reissuing
+addresses that may already be live.
 
 Point it at a real chain with environment variables and no code change:
 
@@ -269,8 +322,10 @@ makes the second claim fail:
 <!-- readme: skip -->
 ```sql
 CREATE TABLE credited_tx (
-    tx_id   TEXT PRIMARY KEY,
-    sale_id TEXT NOT NULL REFERENCES sale(id)   -- no orphan claims
+    recipient TEXT NOT NULL,                      -- the sale's own address
+    tx_id     TEXT NOT NULL,
+    sale_id   TEXT NOT NULL REFERENCES sale(id),  -- no orphan claims
+    PRIMARY KEY (recipient, tx_id)                -- NOT tx_id alone
 );
 ```
 
@@ -287,15 +342,17 @@ try:
             (decision.state, decision.credited_native, sale_id)).rowcount
         if rows != 1:
             raise AlreadyDecided(sale_id)      # abort; claim nothing
-        db.executemany("INSERT INTO credited_tx (tx_id, sale_id) VALUES (?, ?)",
-                       [(t, sale_id) for t in decision.transaction_ids])
+        db.executemany(
+            "INSERT INTO credited_tx (recipient, tx_id, sale_id) VALUES (?, ?, ?)",
+            [(recipient, t, sale_id) for t in decision.transaction_ids])
 except UniqueViolation:                        # NOT bare IntegrityError
     pass          # another sale claimed it first: stay pending, poll again
 except AlreadyDecided:
     pass          # this sale already has an answer; the stored one is the truth
 ```
 
-Three details, each of which has a failure behind it. The **rollback** is why a
+Four details, each of which has a failure behind it. The **composite key** is
+why a batched payout does not strand the second sale it paid. The **rollback** is why a
 sale is never marked paid on someone else's money. The **row count** is why a
 stale worker cannot reopen a settled sale — the uniqueness constraint is blind
 to a decision that claims nothing. And catching **the uniqueness violation
@@ -503,8 +560,12 @@ request, because those read nothing.
 
 ```python
 sorted(registry.get("memory:testnet/native:tok").readiness(unset).ready)
-#   -> ['address-validation', 'payment-request']
+#   -> ['address-validation', 'payment-request', 'settlement']
 ```
+
+Settlement is in that list because `settle` is a pure function of an intent and
+a batch you already hold — it reads nothing. Only observation needs the
+provider, and `chargeable` is still `False`, because it needs all four.
 
 Readiness reports what this deployment can actually do, not what the rail can
 do in principle. A configuration that would leave the observation loop unable
@@ -528,7 +589,7 @@ def apply(decision, sale_id):
     return f"{sale_id}: A PERSON MUST LOOK — {decision.reason}"
 
 apply(decision, "sale-1042")
-#   -> 'sale-1042: paid 250, ids (\'tx-a\',)'
+#   -> "sale-1042: paid 250, ids ('tx-a',)"
 ```
 
 **`pending`** — nothing conclusive yet. Keep polling until your own expiry.

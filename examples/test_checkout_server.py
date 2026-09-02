@@ -35,6 +35,8 @@ class Harness(unittest.TestCase):
 		app.CONFIG = {"endpoint": "memory://", "tip": 60, "page": 20, "transfers": []}
 		app.HEALTH.update(watching=True, why="")
 		app.STATE_FILE = pathlib.Path(self.tmp.name) / "state.json"
+		os.environ["CRYPTOPOS_INIT"] = "1"          # a genuinely fresh allocator
+		self.addCleanup(os.environ.pop, "CRYPTOPOS_INIT", None)
 		app.RECIPIENTS = app.Recipients(app.RAIL, app.DEMO_XPUB, "")
 
 	def pay(self, sale, amount, height, txid):
@@ -126,14 +128,14 @@ class OneTransferOneInvoice(Harness):
 		self.pay(first, 100, 75, "tx-contested")
 
 		barrier = threading.Barrier(2)
-		real = app.SALES.claimed
+		real = app.SALES.claimed_at
 
-		def claimed_then_wait():
-			seen = real()
+		def claimed_then_wait(recipient):
+			seen = real(recipient)
 			barrier.wait()
 			return seen
 
-		app.SALES.claimed = claimed_then_wait
+		app.SALES.claimed_at = claimed_then_wait
 		out = {}
 		threads = [threading.Thread(target=lambda s=s: out.__setitem__(s["id"], app.poll_once(s)))
 		           for s in (first, second)]
@@ -274,6 +276,23 @@ class SharedAddressIsSingleUse(Harness):
 
 		return app.Recipients(Static, None, "mem1static")
 
+	def test_a_failed_first_sale_releases_the_reservation(self):
+		"""Reserving under the lock must not mean one outage disables the shop
+		for good: a reservation for a sale that was never created was shown to
+		nobody, so it is rolled back."""
+		app.RECIPIENTS = self._static()
+
+		def refuse(*_a, **_k):
+			raise RailProviderError("endpoint", "the indexer is down")
+
+		original, app.RAIL.capture_baseline = app.RAIL.capture_baseline, refuse
+		try:
+			with self.assertRaises(RailProviderError):
+				app.start_sale(100)
+		finally:
+			app.RAIL.capture_baseline = original
+		self.assertIsNotNone(app.start_sale(100))          # the shop still works
+
 	def test_the_single_use_survives_a_restart(self):
 		"""'One sale ever' that forgets on restart is 'one sale per process',
 		and the second process hands the address to a second customer while
@@ -308,6 +327,100 @@ class TheWatcherIsSupervised(Harness):
 		self.assertFalse(app.HEALTH["watching"])
 		with self.assertRaises(app.Unhealthy):
 			app.start_sale(100)
+
+
+class OneTransactionCanPayTwoSales(Harness):
+	def test_a_batched_payout_settles_both_sales(self):
+		"""An exchange withdrawing to several addresses sends ONE transaction.
+
+		Claiming the bare transaction id settled the first sale and left the
+		second -- whose customer really paid -- pending forever.
+		"""
+		first = app.start_sale(100)
+		second = app.start_sale(250)
+		self.pay(first, 100, 71, "one-batched-payout")
+		self.pay(second, 250, 71, "one-batched-payout")
+
+		one, two = app.poll_once(first), app.poll_once(second)
+		self.assertEqual((one.state, one.credited_native), ("settled", 100))
+		self.assertEqual((two.state, two.credited_native), ("settled", 250))
+
+	def test_the_same_output_cannot_pay_one_sale_twice(self):
+		"""Scoping by recipient must not weaken the replay guard."""
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "paid-once")
+		self.assertEqual(app.poll_once(sale).state, "settled")
+		self.assertEqual(app.SALES.claimed_at(sale["recipient"]), frozenset({"paid-once"}))
+
+
+class TheDeadlineIsNotAVerdictOnMoney(Harness):
+	def test_a_part_payment_at_the_deadline_goes_to_a_person(self):
+		"""`pending` covers a confirmed part payment and money still maturing.
+		Expiring on the bare state recorded 50 units confirmed on the chain as
+		'the payment window closed with nothing received', sighted zero."""
+		sale = app.start_sale(100)
+		self.pay(sale, 50, 71, "half-of-it")
+		app.SALES._sales[sale["id"]]["expires_at"] = int(time.time()) - 1
+
+		app._watch_one_pass(int(time.time()))
+		stored = app.SALES.get(sale["id"])
+		self.assertEqual(stored["state"], "needs-review")
+		self.assertEqual(stored["sighted_native"], 50)
+
+	def test_a_claim_conflict_at_the_deadline_does_not_expire_the_sale(self):
+		"""A conflict is contention, not an answer; the next poll recomputes.
+
+		The decision must SETTLE and then lose the write, which is the real
+		interleaving: this worker read the claimed set before another worker
+		committed the same transaction.
+		"""
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "contested")
+		app.SALES._credited.add((sale["recipient"], "contested"))   # another worker committed it
+		app.SALES.claimed_at = lambda _r: frozenset()  # ...after we read the set
+		app.SALES._sales[sale["id"]]["expires_at"] = int(time.time()) - 1
+
+		app._watch_one_pass(int(time.time()))
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
+
+
+class KeysAndStateAreChecked(Harness):
+	def test_a_master_key_is_refused(self):
+		"""Deriving 0/index from a master key gives addresses at a path no
+		ordinary wallet scans, so the money arrives where nobody looks."""
+		master = ("xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJ"
+		          "oCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
+		with self.assertRaises(SystemExit):
+			app.Recipients(app.RAIL, master, "")
+
+	def test_a_missing_state_file_is_not_assumed_to_be_a_first_run(self):
+		"""A different working directory looks exactly like a new deployment."""
+		app.start_sale(100)
+		app.STATE_FILE.unlink()
+		del os.environ["CRYPTOPOS_INIT"]
+		with self.assertRaises(SystemExit):
+			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
+
+	def test_coerced_state_is_refused(self):
+		"""int("12") succeeds and means something the file did not say."""
+		app.STATE_FILE.write_text('{"next_index": "12", "static_used": false}')
+		with self.assertRaises(SystemExit):
+			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
+
+	def test_a_static_allocator_cannot_roll_the_counter_backwards(self):
+		"""It re-read only its own flag and wrote a cached index, reissuing
+		address zero over a derived allocator's live addresses."""
+		class Static:
+			key = "bitcoin:testnet4/native:btc"
+
+			class network:
+				namespace, is_testnet = "bitcoin", True
+
+		static = app.Recipients(Static, None, "mem1static")
+		derived = app.Recipients(app.RAIL, app.DEMO_XPUB, "")
+		first = derived.allocate("a")[0]
+		static.allocate("b")
+		self.assertGreater(derived.allocate("c")[0], first)
 
 
 class LateWorkersGetTheTruth(Harness):

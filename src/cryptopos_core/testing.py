@@ -67,9 +67,12 @@ class MemoryRail:
 			reasons.append("configuration needs a 'page' of at least 1, or observation cannot advance")
 		if not reasons:
 			return Readiness(self.key, self.capabilities)
-		# Validating an address and building a payment request read nothing, so
-		# they stay ready. Observing and settling cannot proceed.
-		blocked = (OBSERVATION, SETTLEMENT)
+		# ONLY OBSERVATION. Validating an address, building a request and
+		# deciding a settlement all read nothing from the provider -- `settle`
+		# is a pure function of the intent and a batch you already hold, and
+		# reporting it unavailable was an imposed policy dressed as a fact.
+		# `chargeable` is still False, because it needs all four.
+		blocked = (OBSERVATION,)
 		reason = "; ".join(reasons)
 		return Readiness(self.key, frozenset(self.capabilities) - set(blocked),
 		                 tuple((capability, reason) for capability in blocked))

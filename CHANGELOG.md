@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Four rounds of adversarial review of the cookbook, the reference example and
-the gate over both found thirty-one defects. Nothing in the payment protocol
+Six rounds of adversarial review of the cookbook, the reference example and
+the gate over both found forty-five defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -94,6 +94,55 @@ and the checks that keep them honest.
     rather than filtering `site-packages` out of the existing one, which had
     left `PYTHONPATH` entries and editable installs reachable. Missing
     `tomllib` now refuses the run instead of silently skipping the comparison.
+* A fifth round found eight more in the example, all fixed and all tested
+  (18 guards, 18 mutants killed):
+  - **A transaction id is not an exclusive payment identifier.** One chain
+    transaction can carry outputs to several addresses, so an exchange batching
+    its withdrawals pays two sales at once; claiming the bare id settled the
+    first and left the second, whose customer really paid, pending forever.
+    Claims are keyed on `(recipient, transaction_id)`, which is exact because
+    every sale has its own address. The README's schema said `PRIMARY KEY
+    (tx_id)` and now says the composite.
+  - `pending` at the deadline was treated as "nothing arrived", so a confirmed
+    part-payment was recorded `expired`, sighted zero, with the money on the
+    chain. The window now closes into `needs-review` whenever anything was
+    sighted, and a claim conflict is not an answer at all.
+  - The static allocator wrote a cached `next_index` inside the lock and could
+    roll a derived allocator's counter backwards, reissuing address zero.
+  - The shared-address flag was committed at allocation, so one provider outage
+    during `capture_baseline` permanently disabled checkout for an address no
+    payer had ever seen. It is committed when the sale exists.
+  - An absent state file was assumed to be a first run — indistinguishable from
+    a different working directory or a restore that missed it. It now requires
+    `CRYPTOPOS_INIT=1` once, and the schema is checked for exact JSON types
+    rather than coerced.
+  - A master extended key was accepted and derived at `0/index`, putting funds
+    at a path no ordinary wallet scans. Depth 0 is refused.
+  - The watcher was started before the server existed, so its shutdown branch
+    found `None` and the process served anyway.
+* A sixth round found six more:
+  - Recipe 1 still defined the claimed set as "every id credited to *any*
+    sale", directly contradicting the obligation added in the same round. The
+    batched-payout case it was written for is now a runnable recipe, so the
+    gate holds the two in agreement.
+  - The static reservation was checked under the lock and persisted after the
+    sale was created, so two processes could both see it free. It is reserved
+    under the lock and released by `close()` when the sale never happens --
+    which keeps the outage case fixed without reopening the race.
+  - `MemoryRail.readiness()` reported settlement unavailable when the provider
+    configuration was bad, but `settle` is a pure function of an intent and a
+    batch and reads nothing. Only observation is blocked now; `chargeable` is
+    still false, because it needs all four.
+  - `tools/readme.py` compares a claim against `repr(value)` rather than
+    type-and-value. `{"b": 2, "a": 1}  # -> {"a": 1, "b": 2}` and
+    `-0.0  # -> 0.0` both passed as equal values a reader would never see. It
+    immediately caught a claim in this README whose quoting was wrong.
+  - The wheel's `Version` was never compared, because this project declares it
+    dynamically and the check skipped an absent `[project].version`. It falls
+    back to the version in the package.
+  - The README embedded in the wheel's `METADATA` -- what PyPI and `pip show`
+    display -- is compared with `README.md`, so the gate cannot approve a
+    document different from the one the artefact publishes.
 
 ## 2.1.1
 

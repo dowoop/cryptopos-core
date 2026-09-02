@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """A complete crypto checkout in one stdlib file.
 
-	python3 checkout_server.py                 # scripted rail, no chain, no funds
+	CRYPTOPOS_INIT=1 python3 checkout_server.py   # scripted rail, no chain, no funds
+	python3 checkout_server.py                    # every run after the first
+
 	CRYPTOPOS_RAIL=bitcoin:testnet4/native:btc \
 	CRYPTOPOS_ENDPOINT=https://mempool.space/testnet4/api \
 	CRYPTOPOS_XPUB=tpub... python3 checkout_server.py
+
+`CRYPTOPOS_INIT=1` is required exactly once, to create the address-allocation
+file. Afterwards its absence means something is wrong -- a different working
+directory, an unmounted volume, a restore that missed it -- and starting from
+zero would reissue receiving addresses that are already live.
 
 Nothing here is Flask-, Django-, or FastAPI-specific: the only framework
 contact points are "read a request" and "write a response". Everything between
@@ -105,9 +112,24 @@ class Sales:
 		with self._lock:
 			return [dict(s) for s in self._sales.values() if s["state"] == "needs-review"]
 
-	def claimed(self):
+	def claimed_at(self, recipient):
+		"""Transaction ids already spent AT THIS RECIPIENT.
+
+		A transaction id alone is not an exclusive payment identifier: one
+		chain transaction can carry outputs to several addresses, so an
+		exchange batching its withdrawals pays two of your sales in one
+		transaction. Claiming the bare id settled the first sale and left the
+		second -- whose customer really paid -- looking unpaid.
+
+		Scoping the claim by recipient is exact *because* every sale has its
+		own address (obligation 1). Two sales can never share a
+		(recipient, transaction) pair, and the same output can never be
+		credited twice to the one sale that owns that address. A host that
+		shares an address between sales gets the old, coarser protection,
+		which is the same trade it already made.
+		"""
 		with self._lock:
-			return frozenset(self._credited)
+			return frozenset(tx for (at, tx) in self._credited if at == recipient)
 
 	def record(self, sale_id, decision):
 		"""Claim the transactions and write the state, or do neither.
@@ -121,15 +143,28 @@ class Sales:
 			sale = self._sales[sale_id]
 			if sale["state"] != "pending":
 				return ALREADY_DECIDED
-			if self._credited.intersection(decision.transaction_ids):
+			mine = {(sale["recipient"], tx) for tx in decision.transaction_ids}
+			if self._credited.intersection(mine):
 				return CONFLICT
 			sale["state"] = decision.state
 			sale["reason"] = decision.reason
 			sale["credited_native"] = decision.credited_native
 			sale["sighted_native"] = decision.sighted_native
 			sale["transaction_ids"] = list(decision.transaction_ids)
-			self._credited.update(decision.transaction_ids)   # claimed with the write
+			self._credited.update(mine)                       # claimed with the write
 			return CLAIMED
+
+	def review(self, sale_id, result):
+		"""Hand a sale to a person, with what was actually seen."""
+		with self._lock:
+			sale = self._sales[sale_id]
+			if sale["state"] != "pending":
+				return False
+			sale["state"] = "needs-review"
+			sale["sighted_native"] = result.sighted_native
+			sale["reason"] = (f"the window closed with {result.sighted_native} sighted and "
+			                  f"{result.credited_native} creditable")
+			return True
 
 	def expire(self, sale_id, now):
 		"""Stop watching a sale whose window closed with nothing in it."""
@@ -194,9 +229,19 @@ class Recipients:
 	def __init__(self, rail, xpub, shared_recipient):
 		self._rail = rail
 		self._account = hd.parse_extended_key(xpub) if xpub else None
+		if self._account is not None and self._account.depth == 0:
+			# A MASTER KEY IS NOT AN ACCOUNT KEY. Deriving `0/index` from it
+			# gives addresses at a path no ordinary wallet scans, so the money
+			# arrives somewhere the merchant cannot see. Both rail READMEs warn
+			# about it; accepting it here would make the warning decorative.
+			raise SystemExit(
+				"CRYPTOPOS_XPUB is a master key (depth 0). Use the ACCOUNT key your wallet "
+				"exports -- m/84'/1'/0' for testnet segwit, m/44'/60'/0' for EVM -- so that "
+				"0/index is a path your wallet actually watches.")
 		self._shared = shared_recipient
 		self._lock = threading.Lock()
 		self._open = {}
+		self._committed = set()
 		stored = self._read_state()
 		# PERSISTED, like the index. "One sale ever" that forgets on restart is
 		# "one sale per process", and the second process hands the same address
@@ -225,11 +270,27 @@ class Recipients:
 		here is the reuse failure with extra steps, so this stops instead.
 		"""
 		if not STATE_FILE.exists():
+			# ABSENCE IS NOT PROOF OF A FIRST RUN. A different working
+			# directory, an unmounted volume, a restore that missed the file,
+			# or a tidy-up after an incident all look identical to it -- and
+			# each would reissue index 0 over addresses that are already live.
+			# Starting fresh is an operator's decision, so it must be said.
+			if os.environ.get("CRYPTOPOS_INIT") != "1":
+				raise SystemExit(
+					f"{STATE_FILE} does not exist. If this really is a new deployment, start "
+					f"once with CRYPTOPOS_INIT=1 to create it. If it is not, find the file: "
+					f"allocating from zero would re-issue live receiving addresses.")
 			return {"next_index": 0, "static_used": False}
 		try:
 			stored = json.loads(STATE_FILE.read_text())
-			return {"next_index": int(stored["next_index"]),
-			        "static_used": bool(stored.get("static_used", False))}
+			index, used = stored["next_index"], stored["static_used"]
+			# EXACT TYPES. `int("12")` and `bool("false")` both succeed and
+			# both mean something other than what the file said; a coerced
+			# allocation counter is an allocation counter you do not know.
+			if type(index) is not int or index < 0 or type(used) is not bool:
+				raise ValueError("next_index must be a non-negative JSON integer "
+				                 "and static_used a JSON boolean")
+			return {"next_index": index, "static_used": used}
 		except Exception as exc:
 			raise SystemExit(
 				f"{STATE_FILE} is unreadable ({exc}). Refusing to allocate: assuming zero "
@@ -239,7 +300,7 @@ class Recipients:
 	def _read_counter(cls):
 		return cls._read_state()["next_index"]
 
-	def _save(self):
+	def _save(self, state):
 		"""Replace the stored state atomically and durably.
 
 		`write_text` truncates first, so a crash mid-write leaves a file that
@@ -249,13 +310,12 @@ class Recipients:
 		"""
 		temporary = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
 		with open(temporary, "w") as handle:
-			# MONOTONIC. Once a shared recipient has backed a sale it has done so
-			# forever, so this flag may only ever go from false to true -- a
-			# derived-mode save must not be able to clear a static deployment's
-			# record of it.
-			handle.write(json.dumps({"next_index": self._next,
-			                         "static_used": self._static_spent
-			                         or self._read_state()["static_used"]}))
+			# EVERY FIELD COMES FROM THE CALLER, which read the whole state
+			# inside the lock. Writing a cached `self._next` let a static
+			# allocator roll a derived allocator's counter backwards and
+			# reissue address zero.
+			handle.write(json.dumps({"next_index": state["next_index"],
+			                         "static_used": state["static_used"]}))
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, STATE_FILE)
@@ -298,29 +358,62 @@ class Recipients:
 				# this address settles on the previous customer's money. There
 				# is no sequential version of a shared address that is safe.
 				with self._across_processes():
-					self._static_spent = self._read_state()["static_used"]
+					state = self._read_state()
+					self._static_spent = state["static_used"]
 					if self._open or self._static_spent:
 						raise ValueError(
 							"this deployment has no per-sale address source, and its single "
 							"recipient has already been used. An address that was shown to a "
 							"payer can still be paid, so it can never back a second sale. "
 							"Set CRYPTOPOS_XPUB.")
+					# RESERVE IT HERE, under the same lock that just read it.
+					# Checking under the lock and persisting later left a
+					# window in which two processes both saw `false` and both
+					# opened a sale at the one permitted address. The reserve
+					# is rolled back by `close()` if the sale is never created,
+					# which is what keeps a provider outage from permanently
+					# disabling checkout.
 					self._static_spent = True
-					self._save()
+					self._save({"next_index": state["next_index"], "static_used": True})
 				self._open[sale_id] = self._shared
 				return -1, self._shared
 			with self._across_processes():
-				self._next = self._read_counter()      # re-read INSIDE the lock
-				index, self._next = self._next, self._next + 1
-				self._save()                           # durable BEFORE the address is shown
+				state = self._read_state()             # whole state, INSIDE the lock
+				index = state["next_index"]
+				self._next = index + 1
+				# Durable BEFORE the address is shown.
+				self._save({"next_index": self._next, "static_used": state["static_used"]})
 			address = self._address(index)
 			self._open[sale_id] = address
 			return index, address
 
-	def close(self, sale_id):
-		"""Forget an open sale. The ADDRESS is not returned to anything."""
+	def commit(self, sale_id):
+		"""Mark this allocation as having become a sale a payer can see.
+
+		The static reservation was already taken under the lock in `allocate`;
+		this only stops `close` from releasing it.
+		"""
 		with self._lock:
-			self._open.pop(sale_id, None)
+			self._committed.add(sale_id)
+
+	def close(self, sale_id):
+		"""Forget an open sale, releasing an UNCOMMITTED static reservation.
+
+		A derived index is never released -- it was shown, or might have been.
+		A static reservation taken for a sale that was never created was shown
+		to nobody, and holding it would let one provider outage disable a
+		deployment for good.
+		"""
+		with self._lock:
+			had = self._open.pop(sale_id, None)
+			committed = sale_id in self._committed
+			self._committed.discard(sale_id)
+			if self.per_sale or had is None or committed:
+				return
+			with self._across_processes():
+				state = self._read_state()
+				self._static_spent = False
+				self._save({"next_index": state["next_index"], "static_used": False})
 
 
 RAIL, CONFIG, RECIPIENTS, SERVER = None, None, None, None
@@ -359,10 +452,12 @@ def load_rail():
 
 
 DEMO_CHAIN = {"tip": 60, "page": 20, "transfers": []}
-#: BIP-32 test vector 1. A published key with a published seed: fine for a demo
-#: whose coins do not exist, and never for anything else.
-DEMO_XPUB = ("xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJ"
-             "oCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
+#: BIP-32 test vector 1 at m/0H -- a published key with a published seed, and
+#: depth 1 rather than the master, so the demo goes through the same
+#: account-key check a real deployment does. Fine for a demo whose coins do not
+#: exist, and never for anything else.
+DEMO_XPUB = ("xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK"
+             "1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw")
 
 
 def start_sale(amount_native):
@@ -402,13 +497,18 @@ def _open_sale(sale_id, amount_native, index, recipient):
 		baseline=baseline,
 	)
 	request = RAIL.create_request(intent)
-	return SALES.create({
+	sale = SALES.create({
 		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
 		"credited_native": 0, "sighted_native": 0, "transaction_ids": [],
 		"expires_at": intent.expires_at_epoch,
 		"recipient": recipient, "index": index, "notice": request.payer_notice,
 	})
+	# The address is spent HERE: the sale exists and its instruction is about
+	# to be shown. Committing at allocation meant one provider outage during
+	# `capture_baseline` permanently disabled a static deployment.
+	RECIPIENTS.commit(sale_id)
+	return sale
 
 
 def poll_once(sale):
@@ -422,20 +522,48 @@ def poll_once(sale):
 	while not batch.complete:
 		batch = RAIL.observe(intent, CONFIG, batch)
 
-	decision = RAIL.settle(intent, batch, claimed_transaction_ids=SALES.claimed())
+	decision = RAIL.settle(intent, batch,
+	                       claimed_transaction_ids=SALES.claimed_at(sale["recipient"]))
 	if decision.state == "pending":
-		return decision
+		return PollResult("pending", 0, decision.sighted_native, (), decision.reason)
 
 	outcome = SALES.record(sale["id"], decision)
 	if outcome == CLAIMED:
 		RECIPIENTS.close(sale["id"])
-		return decision
+		return PollResult(decision.state, decision.credited_native, decision.sighted_native,
+		                  decision.transaction_ids, decision.reason)
 	if outcome == ALREADY_DECIDED:
 		# Do not report this worker's stale view. The stored state is the answer,
 		# and there is no next poll for a sale that has left `open_sales()`.
-		return _stored_decision(sale["id"])
-	return decision.__class__("pending", 0, decision.sighted_native,
-	                          reason="a transaction was claimed by another sale")
+		stored = _stored_decision(sale["id"])
+		return PollResult(stored.state, stored.credited_native, stored.sighted_native,
+		                  stored.transaction_ids, stored.reason)
+	# A CONFLICT IS NOT AN ANSWER. Another sale claimed one of these
+	# transactions between our read and our write; the next poll recomputes
+	# against the larger claimed set. Expiring on it would record money that
+	# demonstrably arrived as "nothing received".
+	return PollResult("pending", 0, decision.sighted_native, (),
+	                  "a transaction was claimed by another sale", conflict=True)
+
+
+@dataclass(frozen=True)
+class PollResult:
+	"""What one poll concluded, and enough about it to act at the deadline.
+
+	`pending` is not one thing. It covers a confirmed part-payment, money still
+	maturing toward its confirmation depth, and a decision that lost a claim
+	race -- and the deadline must treat none of those as "nothing arrived".
+	Expiring on the bare state recorded a sale with 50 units confirmed on the
+	chain as `expired`, reason "the payment window closed with nothing
+	received", sighted zero.
+	"""
+
+	state: str
+	credited_native: int
+	sighted_native: int
+	transaction_ids: tuple
+	reason: str
+	conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -511,12 +639,22 @@ def _watch_one_pass(now):
 			# away silently. And if this read fails, we do NOT know the
 			# sale was unpaid -- so the provider branch below leaves it
 			# open rather than expiring it on ignorance.
-			decision = poll_once(sale)
-			if decision.state == "pending" and now >= sale["expires_at"]:
-				# (see Recipients) The address is NOT recycled: the QR it
-				# issued is still payable by whoever kept it.
-				if SALES.expire(sale["id"], now):
+			result = poll_once(sale)
+			if result.state != "pending" or now < sale["expires_at"]:
+				continue
+			if result.conflict:
+				continue                  # unresolved contention, not an answer
+			if result.sighted_native:
+				# Money is on the chain and not creditable yet -- a part
+				# payment, or one still maturing. That is a person's decision,
+				# never a silent "nothing arrived".
+				if SALES.review(sale["id"], result):
 					RECIPIENTS.close(sale["id"])
+				continue
+			# (see Recipients) The address is NOT recycled: the QR it issued
+			# is still payable by whoever kept it.
+			if SALES.expire(sale["id"], now):
+				RECIPIENTS.close(sale["id"])
 		except RailProviderError as exc:
 			# A PROVIDER ERROR IS NOT A VERDICT -- and it is the only thing
 			# this handler may swallow. Anything else repeats
@@ -647,13 +785,15 @@ def main():
 	binding = "a derived address per sale" if RECIPIENTS.per_sale else \
 		"ONE shared address -- one open sale at a time, and unsafe for real money"
 	print(f"rail {RAIL.key} -- {binding}")
+	global SERVER
+	# BEFORE the watcher starts. If the watcher died first, its shutdown branch
+	# found SERVER still None, did nothing, and main went on to serve.
+	SERVER = ThreadingHTTPServer(("127.0.0.1", 8099), Handler)
 	threading.Thread(target=watcher, daemon=True).start()
 	if RAIL.key.startswith("memory:"):
 		threading.Thread(target=demo_payer, daemon=True).start()
 		print("demo rail: a scripted payer settles each sale about 8s after you charge it")
 	print("http://127.0.0.1:8099        (review queue: /review)")
-	global SERVER
-	SERVER = ThreadingHTTPServer(("127.0.0.1", 8099), Handler)
 	SERVER.serve_forever()
 
 
