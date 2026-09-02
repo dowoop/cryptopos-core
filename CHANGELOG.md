@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Eighteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-four defects. Nothing in the payment protocol
+Nineteen rounds of adversarial review of the cookbook, the reference example
+and the gate over both found ninety-five defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -334,6 +334,13 @@ and the checks that keep them honest.
   example still described the pre-fix behaviour of an immature late transfer.
   Markers are inventoried for every block before dispatch, and a `raises` block
   carrying one is refused exactly as a `skip` block is.
+* A nineteenth round found one, in the prose: the obligation list still said a
+  rail returns `needs-review` when a transaction's status cannot be
+  established. It returns `pending` -- as a checked example twenty pages later
+  showed -- because not knowing is the absence of a decision. The list now
+  separates established-but-not-creditable money from an unresolved read, and
+  says that routing persistent uncertainty to a person is the host's grace
+  policy rather than the rail's verdict.
 
 ## 2.1.1
 

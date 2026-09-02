@@ -125,11 +125,14 @@ project real money at least once:
    provider call could read. Deciding on a partial read is deciding on a
    partial payment.
 5. **`needs-review` is a real outcome, not an error, and it needs somewhere to
-   go.** The rails here return it when money was seen and they will not guess
-   whose it is, or when a transaction's status could not be established — but
-   that is their convention, not something `SettlementDecision` enforces, so
-   read the reason rather than assuming an amount. A status string is not a
-   queue; give a person a list they actually see.
+   go.** The rails here return it for money that is *established* and not
+   creditable — a matured transfer that arrived after the window, say. A
+   transaction whose status could not be established stays `pending` instead,
+   because not knowing is the absence of a decision and a terminal state taken
+   on it loses a sale to a transient read; routing persistent uncertainty to a
+   person is your grace policy, not the rail's. None of that is enforced by
+   `SettlementDecision`, so read the reason rather than assuming an amount. And
+   a status string is not a queue: give a person a list they actually see.
 
 ---
 
