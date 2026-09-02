@@ -59,9 +59,12 @@ conversion that made every payment look late, a test fixture that agreed with
 the defect it was meant to catch, and an adapter asked with another chain's RPC
 method. **A green suite is not evidence that a rail works.**
 
-Every Python example in this file is executed by `tools/readme.py` against the
-built wheel, so the recipes below are checked rather than remembered. Blocks
-that need a live chain or real funds are marked and shown but not run.
+Every Python example in this file is executed by `tools/readme.py`, which fails
+if a `# ->` claim is not exactly what the code produces — so the recipes below
+are checked rather than remembered. `--wheel` re-runs them in a fresh isolated
+interpreter against `dist/*.whl`, and refuses if that wheel does not match this
+tree. Blocks that need a live chain or real funds are marked and shown, not
+run.
 
 ---
 
@@ -104,7 +107,7 @@ project real money at least once:
    before either writes, and one transfer settles two invoices. What saves you
    is that claiming can *fail*: a `PRIMARY KEY` over the claim, and the losing
    `INSERT` rolling back the sale state with it.
-   **Key it on `(recipient, transaction_id)`, not the id alone.** A transaction
+   **Key it on `(rail, recipient, transaction_id)`, not the id alone.** A transaction
    id is not an exclusive payment identifier: one chain transaction can carry
    outputs to several addresses, so an exchange batching its withdrawals pays
    two of your sales at once. Claiming the bare id settles the first and leaves
@@ -112,7 +115,9 @@ project real money at least once:
    the example here. Scoping by recipient is exact precisely *because* of
    obligation 1: two sales never share an address, so they never share a
    (recipient, transaction) pair, while the same output still cannot be
-   credited twice to the sale that owns that address.
+   credited twice to the sale that owns that address. The rail belongs in the
+   key too: transaction ids and address strings are per-network, and two rails
+   can mint the same-looking pair.
 3. **Capture the baseline before the payer sees the request.** It pins the
    chain position the sale starts from. Capture it late and a transfer that
    predates the sale can be credited to it.
@@ -120,8 +125,11 @@ project real money at least once:
    provider call could read. Deciding on a partial read is deciding on a
    partial payment.
 5. **`needs-review` is a real outcome, not an error, and it needs somewhere to
-   go.** It means money is involved and the rail will not guess whose it is.
-   A status string is not a queue; give a person a list they actually see.
+   go.** The rails here return it when money was seen and they will not guess
+   whose it is, or when a transaction's status could not be established — but
+   that is their convention, not something `SettlementDecision` enforces, so
+   read the reason rather than assuming an amount. A status string is not a
+   queue; give a person a list they actually see.
 
 ---
 
@@ -229,7 +237,7 @@ batched = {**chain, "tip": 140, "transfers": [
 ]}
 
 def sale_at(name, recipient, amount):
-    opened = rail.capture_baseline(recipient, {"tip": 100})
+    opened = rail.capture_baseline(recipient, {**chain, "tip": 100})
     return PaymentIntent(name, rail.key, recipient, amount,
                          1_787_100_000, 1_787_101_800, baseline=opened)
 
@@ -271,7 +279,10 @@ CRYPTOPOS_INIT=1 python3 examples/checkout_server.py
 ```
 
 `CRYPTOPOS_INIT=1` is needed once, to create the file that remembers which
-derivation indices have been handed out. After that its absence is a symptom
+derivation indices have been handed out — and how many have gone unpaid, so the
+server can **refuse new sales** before it walks the watching wallet past its gap
+limit. That refusal is the backpressure the gap-limit warning asks for; a
+warning in a README stops nobody from posting a hundred abandoned checkouts. After that its absence is a symptom
 rather than a fresh start, and the server refuses rather than reissuing
 addresses that may already be live.
 
@@ -322,10 +333,11 @@ makes the second claim fail:
 <!-- readme: skip -->
 ```sql
 CREATE TABLE credited_tx (
-    recipient TEXT NOT NULL,                      -- the sale's own address
+    rail_key  TEXT NOT NULL,                          -- ids are not global
+    recipient TEXT NOT NULL,                          -- the sale's own address
     tx_id     TEXT NOT NULL,
-    sale_id   TEXT NOT NULL REFERENCES sale(id),  -- no orphan claims
-    PRIMARY KEY (recipient, tx_id)                -- NOT tx_id alone
+    sale_id   TEXT NOT NULL REFERENCES sale(id),      -- no orphan claims
+    PRIMARY KEY (rail_key, recipient, tx_id)          -- NOT tx_id alone
 );
 ```
 
@@ -343,8 +355,9 @@ try:
         if rows != 1:
             raise AlreadyDecided(sale_id)      # abort; claim nothing
         db.executemany(
-            "INSERT INTO credited_tx (recipient, tx_id, sale_id) VALUES (?, ?, ?)",
-            [(recipient, t, sale_id) for t in decision.transaction_ids])
+            "INSERT INTO credited_tx (rail_key, recipient, tx_id, sale_id) "
+            "VALUES (?, ?, ?, ?)",
+            [(rail.key, recipient, t, sale_id) for t in decision.transaction_ids])
 except UniqueViolation:                        # NOT bare IntegrityError
     pass          # another sale claimed it first: stay pending, poll again
 except AlreadyDecided:
@@ -555,8 +568,8 @@ dict(withheld["memory:testnet/native:tok"])["observation"]
 ```
 
 Per capability means *per capability*: an unreachable provider stops this rail
-observing and settling, and does not stop it checking an address or building a
-request, because those read nothing.
+observing, and does not stop it checking an address, building a request, or
+deciding a settlement, because none of those read anything.
 
 ```python
 sorted(registry.get("memory:testnet/native:tok").readiness(unset).ready)
@@ -592,8 +605,19 @@ apply(decision, "sale-1042")
 #   -> "sale-1042: paid 250, ids ('tx-a',)"
 ```
 
-**`pending`** — nothing conclusive yet. Keep polling until your own expiry.
-Expiry is yours: the rail does not know your refund policy.
+**`pending`** — nothing conclusive yet, which is not the same as nothing
+arrived. It covers a confirmed part payment, money still maturing toward a
+rail's confirmation depth, and a read that could not establish a transaction's
+status. Keep polling; expiry is yours, because the rail does not know your
+refund policy.
+
+**And expiry is a cutoff on the payer, not on the chain.** A transfer made
+honestly at minute fourteen of a fifteen-minute window still needs its
+confirmations — three on Sepolia, a twenty-minute median block on Bitcoin
+testnet4 — so it matures *after* the sale's clock runs out. Closing the sale at
+the deadline throws away a payment that was about to succeed. Let money that
+arrived in time go on maturing for a grace period, and only then ask a person.
+The example does exactly that.
 
 **`settled`** — credited money and at least one transaction id, guaranteed
 together. A settled decision can never carry zero ids; the dataclass refuses to
@@ -701,7 +725,7 @@ def scripted(*transfers, tip=100, page=1000):
 ```python
 half = scripted({"id": "tx-1", "amount": 100, "height": 71},
                 {"id": "tx-2", "amount": 150, "height": 72}, tip=100)
-first = rail.capture_baseline("mem1alice", {"tip": 60})
+first = rail.capture_baseline("mem1alice", {**chain, "tip": 60})
 part = PaymentIntent("sale-2", rail.key, "mem1alice", 250, 1_787_100_000,
                      1_787_101_800, baseline=first)
 rail.settle(part, rail.observe(part, half)).state        # -> 'settled'
@@ -725,7 +749,7 @@ that breaks hosts, so it is worth having as a test of your own:
 
 ```python
 shared = scripted({"id": "tx-shared", "amount": 100, "height": 71}, tip=100)
-opened = rail.capture_baseline("mem1alice", {"tip": 60})
+opened = rail.capture_baseline("mem1alice", {**chain, "tip": 60})
 
 def sale(name):
     return PaymentIntent(name, rail.key, "mem1alice", 100, 1_787_100_000,

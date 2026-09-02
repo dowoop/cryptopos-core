@@ -123,7 +123,7 @@ class OneTransferOneInvoice(Harness):
 		second["intent"] = second["intent"].__class__(
 			second["intent"].intent_id, app.RAIL.key, first["recipient"], 100,
 			second["intent"].created_at_epoch, second["intent"].expires_at_epoch,
-			baseline=app.RAIL.capture_baseline(first["recipient"], {"tip": 60}))
+			baseline=app.RAIL.capture_baseline(first["recipient"], {**app.CONFIG, "tip": 60}))
 		second["recipient"] = first["recipient"]
 		self.pay(first, 100, 75, "tx-contested")
 
@@ -165,6 +165,81 @@ class OneTransferOneInvoice(Harness):
 		self.assertEqual(app.SALES.record(sale["id"], late), app.ALREADY_DECIDED)
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "settled")
 		self.assertEqual(app.SALES.get(sale["id"])["credited_native"], 100)
+
+
+class TheGapLimitIsDefended(Harness):
+	def test_valid_but_unpaid_sales_eventually_get_backpressure(self):
+		"""Validating the amount only changed the attacker's payload from 0
+		to 1. Every allocation is permanent, so a caller opening sales it
+		never pays walks the wallet past its gap limit."""
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
+		try:
+			for _ in range(3):
+				app.start_sale(1)
+			with self.assertRaises(ValueError):
+				app.start_sale(1)
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
+	def test_a_payment_ends_the_unpaid_run(self):
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
+		try:
+			for _ in range(2):
+				app.start_sale(1)
+			paid = app.start_sale(100)
+			self.pay(paid, 100, 71, "a-real-payment")
+			self.assertEqual(app.poll_once(paid).state, "settled")
+			self.assertIsNotNone(app.start_sale(1))     # the run reset
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
+
+class TheDoubleModelsRealChainStates(Harness):
+	def test_an_unconfirmed_transfer_is_sighted_but_not_credited(self):
+		"""Money in the mempool, or still maturing toward a confirmation
+		depth, is the most ordinary pending state there is. The double used to
+		raise out of the protocol's own validation on `confs=0`."""
+		sale = app.start_sale(250)
+		app.CONFIG["tip"] = 100
+		app.CONFIG["transfers"].append({
+			"id": "in-the-mempool", "to": sale["recipient"], "amount": 250,
+			"confs": 0, "height": 71})
+		result = app.poll_once(sale)
+		self.assertEqual(result.state, "pending")
+		self.assertEqual(result.sighted_native, 250)
+		self.assertEqual(result.credited_native, 0)
+
+	def test_an_unconfirmed_payment_at_the_deadline_reaches_a_person(self):
+		"""It is timely and fully funded and simply not mature. Recording it
+		as 'nothing received' loses a payment that was really made."""
+		sale = app.start_sale(250)
+		app.CONFIG["tip"] = 100
+		app.CONFIG["transfers"].append({
+			"id": "still-maturing", "to": sale["recipient"], "amount": 250,
+			"confs": 0, "height": 71})
+		now = int(time.time())
+		app.SALES._sales[sale["id"]]["expires_at"] = now - 1
+		app._watch_one_pass(now + app.MATURATION_GRACE_SECONDS + 1)
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "needs-review")
+
+	def test_money_that_arrived_in_time_is_allowed_to_mature(self):
+		"""Expiry is a cutoff on the PAYER, not on the chain. A transfer one
+		confirmation deep on a rail that wants three is timely and funded, and
+		making it terminal at the deadline loses a payment about to succeed."""
+		sale = app.start_sale(250)
+		app.CONFIG["tip"] = 100
+		unconfirmed = {"id": "maturing", "to": sale["recipient"], "amount": 250,
+		               "confs": 0, "height": 71}
+		app.CONFIG["transfers"].append(unconfirmed)
+		now = int(time.time())
+		app.SALES._sales[sale["id"]]["expires_at"] = now - 1
+
+		app._watch_one_pass(now)
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
+
+		unconfirmed["confs"] = 3                       # two blocks later
+		app._watch_one_pass(now + 10)
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "settled")
 
 
 class RefusesRatherThanGuesses(Harness):
@@ -236,7 +311,9 @@ class TheDeadlineDoesNotEatMoney(Harness):
 			raise RailProviderError("endpoint", "the indexer is down")
 
 		app.RAIL.observe = refuse
-		app._watch_one_pass(int(time.time()))
+		# Well past the grace period: without the conflict check this would be
+		# reviewed; contention is not an answer, so it stays open.
+		app._watch_one_pass(int(time.time()) + app.MATURATION_GRACE_SECONDS + 1)
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
 
 
@@ -360,12 +437,18 @@ class TheDeadlineIsNotAVerdictOnMoney(Harness):
 		'the payment window closed with nothing received', sighted zero."""
 		sale = app.start_sale(100)
 		self.pay(sale, 50, 71, "half-of-it")
-		app.SALES._sales[sale["id"]]["expires_at"] = int(time.time()) - 1
+		now = int(time.time())
+		app.SALES._sales[sale["id"]]["expires_at"] = now - 1
 
-		app._watch_one_pass(int(time.time()))
+		app._watch_one_pass(now)                       # inside the grace period
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
+
+		app._watch_one_pass(now + app.MATURATION_GRACE_SECONDS + 1)
 		stored = app.SALES.get(sale["id"])
 		self.assertEqual(stored["state"], "needs-review")
 		self.assertEqual(stored["sighted_native"], 50)
+		# The reviewer needs to know how much of it was actually creditable.
+		self.assertEqual(stored["credited_native"], 50)
 
 	def test_a_claim_conflict_at_the_deadline_does_not_expire_the_sale(self):
 		"""A conflict is contention, not an answer; the next poll recomputes.
@@ -376,11 +459,13 @@ class TheDeadlineIsNotAVerdictOnMoney(Harness):
 		"""
 		sale = app.start_sale(100)
 		self.pay(sale, 100, 71, "contested")
-		app.SALES._credited.add((sale["recipient"], "contested"))   # another worker committed it
+		app.SALES._credited.add((app.RAIL.key, sale["recipient"], "contested"))  # another worker got it
 		app.SALES.claimed_at = lambda _r: frozenset()  # ...after we read the set
 		app.SALES._sales[sale["id"]]["expires_at"] = int(time.time()) - 1
 
-		app._watch_one_pass(int(time.time()))
+		# Well past the grace period: without the conflict check this would be
+		# reviewed; contention is not an answer, so it stays open.
+		app._watch_one_pass(int(time.time()) + app.MATURATION_GRACE_SECONDS + 1)
 		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
 
 
@@ -421,6 +506,22 @@ class KeysAndStateAreChecked(Harness):
 		first = derived.allocate("a")[0]
 		static.allocate("b")
 		self.assertGreater(derived.allocate("c")[0], first)
+
+
+class NoSaleIsHandedOutUnwatched(Harness):
+	def test_a_watcher_dying_mid_request_does_not_hand_out_a_live_qr(self):
+		"""Checking health once, on the way in, let a customer receive a QR
+		that nothing was left to watch."""
+		original = app.RAIL.capture_baseline
+
+		def die_during(recipient, configuration):
+			app.HEALTH.update(watching=False, why="died mid-request")
+			return original(recipient, configuration)
+
+		app.RAIL.capture_baseline = die_during
+		with self.assertRaises(app.Unhealthy):
+			app.start_sale(100)
+		self.assertEqual(len(app.SALES.in_review()), 1)
 
 
 class LateWorkersGetTheTruth(Harness):

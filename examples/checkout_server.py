@@ -48,7 +48,19 @@ from cryptopos_core.plugin import PaymentIntent
 from cryptopos_core.registry import RailRegistry
 
 WINDOW_SECONDS = 15 * 60
+#: How long money that arrived IN TIME may go on maturing after the window
+#: closes. Expiry is a cutoff on the payer, not on the chain: a transfer made
+#: honestly at minute 14 still needs its confirmations, and on a rail that
+#: settles at three of them, or at Bitcoin's twenty-minute median block, that
+#: happens after the sale's clock has run out.
+MATURATION_GRACE_SECONDS = 60 * 60
 POLL_SECONDS = 5
+#: Indices consumed since the last one that received money. A wallet restoring
+#: from the seed stops after a run of unused addresses -- commonly 20 -- so a
+#: shop that keeps allocating past that puts real money where a restore will
+#: not look. Refusing new sales is the backpressure; raising the wallet's gap
+#: limit and raising this together is the other half.
+UNPAID_RUN_LIMIT = int(os.environ.get("CRYPTOPOS_UNPAID_RUN_LIMIT", "15"))
 STATE_FILE = pathlib.Path(os.environ.get("CRYPTOPOS_STATE", ".checkout-state.json"))
 
 CLAIMED, CONFLICT, ALREADY_DECIDED = "claimed", "conflict", "already-decided"
@@ -74,13 +86,26 @@ class Sales:
 	same set before either writes, and one transfer settles two invoices.
 
 	A lock around the READ does not fix it; the gap is between read and write.
-	What fixes it is that claiming an id can FAIL. Here that is a check inside
-	the lock; in your database it is
+	What fixes it is that claiming can FAIL. Here that is a check inside the
+	lock; in your database it is
 
-	    CREATE TABLE credited_tx (tx_id TEXT PRIMARY KEY, sale_id TEXT NOT NULL)
+	    CREATE TABLE credited_tx (
+	        rail_key  TEXT NOT NULL,
+	        recipient TEXT NOT NULL,
+	        tx_id     TEXT NOT NULL,
+	        sale_id   TEXT NOT NULL REFERENCES sale(id),
+	        PRIMARY KEY (rail_key, recipient, tx_id)
+	    )
 
 	and the INSERT that loses the race raises, rolling back the sale state with
 	it. The constraint is the thing that saves you, not the lock.
+
+	THE KEY IS NOT `tx_id` ALONE. One chain transaction can carry outputs to
+	several addresses, so an exchange batching its withdrawals pays two sales
+	at once; a global claim on the id settles the first and leaves the second,
+	whose customer really paid, unpaid. Nor are ids and addresses global
+	namespaces -- two networks can mint the same-looking strings -- so the rail
+	belongs in the key too.
 
 	The state transition is ALSO conditional. A worker that arrives late holds
 	a decision computed from a stale snapshot -- typically `needs-review`,
@@ -129,7 +154,8 @@ class Sales:
 		which is the same trade it already made.
 		"""
 		with self._lock:
-			return frozenset(tx for (at, tx) in self._credited if at == recipient)
+			return frozenset(tx for (rail, at, tx) in self._credited
+			                 if (rail, at) == (RAIL.key, recipient))
 
 	def record(self, sale_id, decision):
 		"""Claim the transactions and write the state, or do neither.
@@ -143,7 +169,7 @@ class Sales:
 			sale = self._sales[sale_id]
 			if sale["state"] != "pending":
 				return ALREADY_DECIDED
-			mine = {(sale["recipient"], tx) for tx in decision.transaction_ids}
+			mine = {(RAIL.key, sale["recipient"], tx) for tx in decision.transaction_ids}
 			if self._credited.intersection(mine):
 				return CONFLICT
 			sale["state"] = decision.state
@@ -162,6 +188,7 @@ class Sales:
 				return False
 			sale["state"] = "needs-review"
 			sale["sighted_native"] = result.sighted_native
+			sale["credited_native"] = result.credited_native
 			sale["reason"] = (f"the window closed with {result.sighted_native} sighted and "
 			                  f"{result.credited_native} creditable")
 			return True
@@ -280,17 +307,19 @@ class Recipients:
 					f"{STATE_FILE} does not exist. If this really is a new deployment, start "
 					f"once with CRYPTOPOS_INIT=1 to create it. If it is not, find the file: "
 					f"allocating from zero would re-issue live receiving addresses.")
-			return {"next_index": 0, "static_used": False}
+			return {"next_index": 0, "static_used": False, "unpaid_run": 0}
 		try:
 			stored = json.loads(STATE_FILE.read_text())
 			index, used = stored["next_index"], stored["static_used"]
+			run = stored.get("unpaid_run", 0)
 			# EXACT TYPES. `int("12")` and `bool("false")` both succeed and
 			# both mean something other than what the file said; a coerced
 			# allocation counter is an allocation counter you do not know.
-			if type(index) is not int or index < 0 or type(used) is not bool:
-				raise ValueError("next_index must be a non-negative JSON integer "
-				                 "and static_used a JSON boolean")
-			return {"next_index": index, "static_used": used}
+			if (type(index) is not int or index < 0 or type(used) is not bool
+					or type(run) is not int or run < 0):
+				raise ValueError("next_index and unpaid_run must be non-negative JSON "
+				                 "integers and static_used a JSON boolean")
+			return {"next_index": index, "static_used": used, "unpaid_run": run}
 		except Exception as exc:
 			raise SystemExit(
 				f"{STATE_FILE} is unreadable ({exc}). Refusing to allocate: assuming zero "
@@ -315,7 +344,8 @@ class Recipients:
 			# allocator roll a derived allocator's counter backwards and
 			# reissue address zero.
 			handle.write(json.dumps({"next_index": state["next_index"],
-			                         "static_used": state["static_used"]}))
+			                         "static_used": state["static_used"],
+			                         "unpaid_run": state["unpaid_run"]}))
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, STATE_FILE)
@@ -374,18 +404,46 @@ class Recipients:
 					# which is what keeps a provider outage from permanently
 					# disabling checkout.
 					self._static_spent = True
-					self._save({"next_index": state["next_index"], "static_used": True})
+					self._save({"next_index": state["next_index"], "static_used": True,
+					            "unpaid_run": state["unpaid_run"]})
+					# THE ROLLBACK IS NOT CRASH-SAFE, and cannot be while
+					# `Sales` is in memory. If the process dies between here
+					# and `SALES.create`, the one permitted use is durably
+					# spent on a sale that never existed, and this deployment
+					# refuses to open another. Recovery is an operator setting
+					# "static_used" back to false in the state file, after
+					# checking that no payer was ever shown the address. A host
+					# with a durable sale table resolves it automatically:
+					# reservation and sale go in one transaction.
 				self._open[sale_id] = self._shared
 				return -1, self._shared
 			with self._across_processes():
 				state = self._read_state()             # whole state, INSIDE the lock
+				if state["unpaid_run"] >= UNPAID_RUN_LIMIT:
+					# BACKPRESSURE, not a warning in a README. Every allocation
+					# is permanent, so a caller opening sales it never pays
+					# walks the wallet past its gap limit and hides real money
+					# from a restore. Refusing is the only thing that stops it.
+					raise ValueError(
+						f"{state['unpaid_run']} addresses have been issued since the last "
+						f"payment, and the limit is {UNPAID_RUN_LIMIT}. Raise the watching "
+						f"wallet's gap limit and CRYPTOPOS_UNPAID_RUN_LIMIT together, or wait "
+						f"for a sale to be paid.")
 				index = state["next_index"]
 				self._next = index + 1
 				# Durable BEFORE the address is shown.
-				self._save({"next_index": self._next, "static_used": state["static_used"]})
+				self._save({"next_index": self._next, "static_used": state["static_used"],
+				            "unpaid_run": state["unpaid_run"] + 1})
 			address = self._address(index)
 			self._open[sale_id] = address
 			return index, address
+
+	def paid(self):
+		"""A payment landed, so the run of unused addresses is over."""
+		with self._lock, self._across_processes():
+			state = self._read_state()
+			self._save({"next_index": state["next_index"],
+			            "static_used": state["static_used"], "unpaid_run": 0})
 
 	def commit(self, sale_id):
 		"""Mark this allocation as having become a sale a payer can see.
@@ -413,7 +471,8 @@ class Recipients:
 			with self._across_processes():
 				state = self._read_state()
 				self._static_spent = False
-				self._save({"next_index": state["next_index"], "static_used": False})
+				self._save({"next_index": state["next_index"], "static_used": False,
+				            "unpaid_run": state["unpaid_run"]})
 
 
 RAIL, CONFIG, RECIPIENTS, SERVER = None, None, None, None
@@ -445,8 +504,9 @@ def load_rail():
 		else:
 			raise SystemExit(
 				"set CRYPTOPOS_XPUB for a derived address per sale, or CRYPTOPOS_RECIPIENT "
-				"to run one sale at a time at a fixed address (unsafe for real money: a QR "
-				"from a finished sale can still be paid, and would settle the next one).")
+				"to run ONE sale, ever, at a fixed address. Not one at a time: a QR from a "
+				"finished sale can still be paid, and would settle whichever sale holds "
+				"that address next.")
 	RECIPIENTS = Recipients(rail, xpub, shared)
 	return rail, config
 
@@ -508,6 +568,13 @@ def _open_sale(sale_id, amount_native, index, recipient):
 	# to be shown. Committing at allocation meant one provider outage during
 	# `capture_baseline` permanently disabled a static deployment.
 	RECIPIENTS.commit(sale_id)
+	if not HEALTH["watching"]:
+		# The watcher died while this request was inside `capture_baseline`.
+		# Checking health once, on the way in, let a customer be handed a live
+		# QR that nothing was left to watch. The address is already spent, so
+		# the sale cannot be withdrawn -- it goes straight to a person.
+		SALES.review(sale_id, PollResult("pending", 0, 0, (), "no watcher"))
+		raise Unhealthy(HEALTH["why"])
 	return sale
 
 
@@ -525,10 +592,16 @@ def poll_once(sale):
 	decision = RAIL.settle(intent, batch,
 	                       claimed_transaction_ids=SALES.claimed_at(sale["recipient"]))
 	if decision.state == "pending":
-		return PollResult("pending", 0, decision.sighted_native, (), decision.reason)
+		# CARRY WHAT THE RAIL SAID. Overwriting `credited_native` with zero
+		# threw away a confirmed part payment: a rail can report pending with
+		# money already creditable, just not enough of it.
+		return PollResult("pending", decision.credited_native, decision.sighted_native,
+		                  (), decision.reason)
 
 	outcome = SALES.record(sale["id"], decision)
 	if outcome == CLAIMED:
+		if decision.state == "settled":
+			RECIPIENTS.paid()
 		RECIPIENTS.close(sale["id"])
 		return PollResult(decision.state, decision.credited_native, decision.sighted_native,
 		                  decision.transaction_ids, decision.reason)
@@ -645,9 +718,14 @@ def _watch_one_pass(now):
 			if result.conflict:
 				continue                  # unresolved contention, not an answer
 			if result.sighted_native:
-				# Money is on the chain and not creditable yet -- a part
-				# payment, or one still maturing. That is a person's decision,
-				# never a silent "nothing arrived".
+				# MONEY ARRIVED IN TIME AND IS NOT CREDITABLE YET. Making that
+				# terminal at the deadline loses payments that were about to
+				# succeed: a transfer one confirmation deep on a rail that
+				# wants three is timely, funded, and simply not mature. Keep
+				# polling through the grace period; only then does a person
+				# decide.
+				if now < sale["expires_at"] + MATURATION_GRACE_SECONDS:
+					continue
 				if SALES.review(sale["id"], result):
 					RECIPIENTS.close(sale["id"])
 				continue
@@ -783,7 +861,7 @@ def main():
 	global RAIL, CONFIG
 	RAIL, CONFIG = load_rail()
 	binding = "a derived address per sale" if RECIPIENTS.per_sale else \
-		"ONE shared address -- one open sale at a time, and unsafe for real money"
+		"ONE shared address -- one sale for its whole lifetime, and unsafe for real money"
 	print(f"rail {RAIL.key} -- {binding}")
 	global SERVER
 	# BEFORE the watcher starts. If the watcher died first, its shutdown branch

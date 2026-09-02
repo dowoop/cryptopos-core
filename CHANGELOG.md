@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Six rounds of adversarial review of the cookbook, the reference example and
-the gate over both found forty-five defects. Nothing in the payment protocol
+Eight rounds of adversarial review of the cookbook, the reference example and
+the gate over both found sixty-two defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -143,6 +143,54 @@ and the checks that keep them honest.
   - The README embedded in the wheel's `METADATA` -- what PyPI and `pip show`
     display -- is compared with `README.md`, so the gate cannot approve a
     document different from the one the artefact publishes.
+* A seventh round found seven more:
+  - `MemoryRail` could not represent an unconfirmed transfer: every readable
+    one was built `confirmed=True`, so `confs=0` raised out of the protocol's
+    own validation. Money in the mempool, and money still maturing toward a
+    confirmation depth, are the most ordinary pending states there are, and a
+    double that cannot model them cannot test the paths that matter.
+  - `MemoryRail.readiness()` refused observation without an `endpoint` while
+    `observe` never read one, so the reason was invented. The endpoint is now
+    genuinely required, which is what makes the readiness report true.
+  - The README said an unreachable provider stops the rail "observing and
+    settling" six lines above a checked claim showing settlement still ready.
+  - The obligation list asserted that `needs-review` means money is involved.
+    That is these rails' convention, not something `SettlementDecision`
+    enforces; the wording now says so and tells a host to read the reason.
+  - Claims are compared to `repr` EXACTLY. Collapsing whitespace on both sides
+    let `"a  b"  # -> 'a b'` pass -- a difference a reader would copy.
+  - The embedded-README comparison had the same lossy normalisation, and an
+    absent description was exempt rather than a difference. Both fixed.
+  - `--wheel` now runs in a fresh `python -I -S` subprocess. Rebuilding
+    `sys.path` in-process left `sys.modules`, package `__path__`, import hooks
+    and `sitecustomize` untouched; verified against a `sitecustomize` that
+    preloads a fake package, which the isolated run no longer sees.
+* An eighth round found ten more, and two of them were the example teaching the
+  bug the README had just fixed:
+  - The `Sales` docstring still showed `CREATE TABLE credited_tx (tx_id TEXT
+    PRIMARY KEY, ...)`, the exact global key the batched-payout case defeats,
+    and the start-up message still offered a fixed recipient as "one sale at a
+    time" after that model had been rejected.
+  - The claim key gained the rail: transaction ids and address strings are
+    per-network, so a database serving two rails can collide on both.
+  - **Expiry is a cutoff on the payer, not on the chain.** Money that arrived
+    in time but had not matured -- one confirmation where the rail wants three,
+    or a Bitcoin transfer waiting on a twenty-minute median block -- was made
+    terminally `needs-review` at the deadline, so a payment two blocks from
+    settling never settled. Sighted money now goes on being polled through a
+    maturation grace period.
+  - A pending decision can name creditable money; `poll_once` overwrote it with
+    zero and the review record dropped it, so a reviewer was told 50 was
+    sighted and nothing was creditable when 50 was.
+  - Validating the amount only changed an attacker's payload from 0 to 1: valid
+    unpaid sales still walked the wallet past its gap limit. The allocator
+    tracks the run of addresses issued since the last payment and REFUSES new
+    sales past a limit, which is the backpressure the README asked for.
+  - A watcher that died while a request sat inside `capture_baseline` still
+    handed that customer a live QR. Health is re-checked after the sale exists,
+    and the sale goes straight to review rather than out of the door.
+  - `MemoryRail` now reports the creditable amount on a pending decision, so a
+    host can test part payments at all.
 
 ## 2.1.1
 

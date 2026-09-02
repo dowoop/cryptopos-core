@@ -24,12 +24,18 @@ accident; importing it is an explicit act. It must never appear in a
 deployment's registry.
 """
 
+from .errors import RailProviderError
 from .plugin import (
 	ADDRESS_VALIDATION, OBSERVATION, PAYMENT_REQUEST, SETTLEMENT,
 	Asset, Network, ObservationBatch, PaymentRequest, Readiness,
 	RecipientBaseline, SettlementDecision, TransferObservation,
 	NOT_UNCONDITIONAL,
 )
+
+
+def _require_endpoint(configuration):
+	if not configuration.get("endpoint"):
+		raise RailProviderError("memory", "no endpoint configured")
 
 
 class MemoryRail:
@@ -81,6 +87,7 @@ class MemoryRail:
 		return ("ok", "") if recipient.startswith("mem1") else ("refused", "not a memory address")
 
 	def capture_baseline(self, recipient, configuration):
+		_require_endpoint(configuration)
 		return RecipientBaseline(self.key, recipient, "memory", tip=configuration["tip"])
 
 	def create_request(self, intent):
@@ -88,6 +95,11 @@ class MemoryRail:
 		                      intent.recipient, intent.amount_native)
 
 	def observe(self, intent, configuration, previous=None):
+		# READINESS MUST BE TRUE OF THE THING IT DESCRIBES. This refused
+		# observation when `endpoint` was empty and then observed perfectly
+		# well without one, which made the endpoint decorative and the reason
+		# invented. A rail that says it needs its provider has to need it.
+		_require_endpoint(configuration)
 		tip = configuration["tip"]
 		after = previous.observed_through_tip if previous else intent.baseline.tip
 		through = min(after + configuration.get("page", 10**9), tip)
@@ -101,10 +113,15 @@ class MemoryRail:
 		# seen; only its status is unknown. Dropping it would hide the money
 		# from `sighted_native`, and the gap between sighted and credited is
 		# the whole reason a person is asked to look.
+		# An UNCONFIRMED transfer is ordinary: money in the mempool, or money
+		# still maturing toward a rail's confirmation depth. Building every
+		# readable transfer as confirmed made `confs=0` raise out of the
+		# protocol's own validation, so the double could not model the most
+		# common pending state there is.
 		transfers = tuple(
-			TransferObservation(t["id"], t["amount"], True, t["confs"], t["height"])
-			if not t.get("unreadable") else
 			TransferObservation(t["id"], t["amount"], False, 0)
+			if t.get("unreadable") or not t["confs"] else
+			TransferObservation(t["id"], t["amount"], True, t["confs"], t["height"])
 			for t in visible
 		)
 		unresolved = tuple(t["id"] for t in visible if t.get("unreadable"))
@@ -124,5 +141,9 @@ class MemoryRail:
 		if credited >= intent.amount_native:
 			return SettlementDecision("settled", credited, sighted,
 			                          tuple(t.transaction_id for t in usable))
-		return SettlementDecision("pending", 0, sighted,
+		# A PENDING DECISION CAN STILL NAME CREDITABLE MONEY. A part payment is
+		# not nothing, and a host that shows the customer how much is
+		# outstanding needs the number. `SettlementDecision` allows it; only a
+		# SETTLED decision may claim transaction ids.
+		return SettlementDecision("pending", credited, sighted,
 		                          reason=f"{credited} of {intent.amount_native} seen")
