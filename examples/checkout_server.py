@@ -34,6 +34,7 @@ import html
 import json
 import os
 import pathlib
+import re
 import threading
 import time
 import uuid
@@ -644,6 +645,10 @@ URI_SCHEMES = {"memory": "memory", "bitcoin": "bitcoin",
 AMOUNT_PARAMETERS = {"memory": ("amount", "native"), "bitcoin": ("amount", "decimal"),
                      "ethereum": ("value", "native"), "polygon": ("value", "native")}
 
+#: ASCII digits only. Deliberately narrower than Python's own numeric grammars.
+_NATIVE_AMOUNT = re.compile(r"[0-9]+")
+_DECIMAL_AMOUNT = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
 
 def _check_amount(rail, uri, arguments, wanted):
 	"""Refuse a URI that asks the payer for anything but the invoiced amount.
@@ -662,13 +667,25 @@ def _check_amount(rail, uri, arguments, wanted):
 	if len(stated) != 1:
 		raise ValueError(f"the payment URI states the amount {len(stated)} times in `{name}`; "
 		                 f"exactly once is the invoice")
-	try:
-		if kind == "native":
-			asked = int(stated[0])
-		else:
-			asked = int(Decimal(stated[0]).scaleb(rail.asset.decimals))
-	except (ArithmeticError, ValueError):
-		raise ValueError(f"the payment URI's amount {stated[0]!r} is not a number") from None
+	# THE URI GRAMMAR, NOT PYTHON'S. `int` and `Decimal` accept `1_000`,
+	# `1.25E-3` and full-width digits; BIP-21 and ERC-681 accept none of those,
+	# and a wallet reading the same text will not agree with a parser that does.
+	text = stated[0]
+	pattern = _NATIVE_AMOUNT if kind == "native" else _DECIMAL_AMOUNT
+	if not pattern.fullmatch(text):
+		raise ValueError(f"the payment URI's amount {text!r} is not written the way this "
+		                 f"scheme states amounts")
+	if kind == "native":
+		asked = int(text)
+	else:
+		# EXACT, NEVER TRUNCATED. `int(Decimal("0.001250009") * 10**8)` is
+		# 125000 -- an amount that is not the invoice and not a whole number of
+		# atomic units -- and it used to be accepted as though it were both.
+		scaled = Decimal(text).scaleb(rail.asset.decimals)
+		if scaled != scaled.to_integral_value():
+			raise ValueError(f"the payment URI's amount {text!r} is finer than one atomic "
+			                 f"unit of {rail.asset.symbol}")
+		asked = int(scaled)
 	if asked != wanted:
 		raise ValueError(f"the payment URI asks for {asked}, and the invoice is {wanted}")
 

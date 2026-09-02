@@ -941,6 +941,30 @@ class RequestsAreCheckedAgainstTheirSale(Harness):
 		with self.assertRaises(ValueError):
 			app._check_payment_identity(Btc, Intent, address, f"bitcoin:{address}")
 
+	def test_an_amount_is_read_by_the_uri_grammar_not_pythons(self):
+		"""`int` and `Decimal` accept `1_000`, `1.25E-3` and full-width digits.
+		BIP-21 and ERC-681 accept none of those, and a wallet reading the same
+		text will not agree with a parser that does."""
+		class Btc:
+			key = "bitcoin:testnet4/native:btc"
+
+			class network:
+				namespace, reference, is_testnet = "bitcoin", "testnet4", True
+
+			class asset:
+				namespace, reference, decimals, symbol = "native", "btc", 8, "BTC"
+
+		class Intent:
+			amount_native = 125_000
+
+		address = "tb1qp5wfcq48h6d63wyy9qz0awtpfqwwv4smhppgv3"
+		app._check_payment_identity(Btc, Intent, address,
+		                            f"bitcoin:{address}?amount=0.00125000")
+		for bad in ("1.25E-3", "0.001_250_00", "0.001250009", "0.0012500001", "\uff10.001"):
+			with self.assertRaises(ValueError):
+				app._check_payment_identity(Btc, Intent, address,
+				                            f"bitcoin:{address}?amount={bad}")
+
 	def test_a_bitcoin_uri_amount_is_read_as_a_decimal(self):
 		"""BIP-21 states a decimal amount; ERC-681 states an integer. Reading
 		one as the other is off by a factor of 10**decimals."""

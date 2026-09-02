@@ -3,7 +3,7 @@
 ## 2.2.0
 
 Nineteen rounds of adversarial review of the cookbook, the reference example
-and the gate over both found ninety-seven defects, after which the adversary
+and the gate over both found ninety-nine defects, after which the adversary
 reported convergence. What it could not close is published as a trust boundary
 in README.md rather than left implied. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
@@ -348,6 +348,13 @@ and the checks that keep them honest.
   is checked in both forms -- BIP-21's decimal and ERC-681's integer, which
   differ by 10**decimals -- exactly once, so a rail cannot ask the customer for
   a number the sale never invoiced.
+* The first version of that amount check was itself wrong, and the adversary
+  caught it: `int(Decimal("0.001250009") * 10**8)` is 125,000, so a URI asking
+  for an amount that was neither the invoice nor a whole number of satoshis was
+  approved. It also inherited Python's numeric grammars, accepting `1.25E-3`,
+  `1_000` and full-width digits that no wallet reading BIP-21 or ERC-681 would.
+  The text is matched against the scheme's own grammar, and the scaled decimal
+  must be exactly integral before it is converted.
 
 ## 2.1.1
 

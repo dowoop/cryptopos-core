@@ -1091,6 +1091,11 @@ leases and review queue are in memory and a restart loses them. It has no
 authentication, no operator workflow, and no database, and its allocator
 assumes POSIX locking and a trustworthy filesystem.
 
+**Independent price sources are trusted not to fail together.** HTTPS,
+corroboration and a disagreement limit constrain one bad feed. They cannot
+prove that several vendors are not wrong, or compromised, in the same
+direction.
+
 **Custody stays outside.** Keys, signing, refunds, payouts, treasury movement
 and incident response are not what a watch-only receiving rail is for.
 
