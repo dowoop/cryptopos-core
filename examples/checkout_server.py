@@ -55,11 +55,11 @@ WINDOW_SECONDS = 15 * 60
 #: happens after the sale's clock has run out.
 MATURATION_GRACE_SECONDS = 60 * 60
 POLL_SECONDS = 5
-#: Indices consumed since the last one that received money. A wallet restoring
-#: from the seed stops after a run of unused addresses -- commonly 20 -- so a
-#: shop that keeps allocating past that puts real money where a restore will
-#: not look. Refusing new sales is the backpressure; raising the wallet's gap
-#: limit and raising this together is the other half.
+#: The longest run of UNUSED indices a deployment may leave behind. A wallet
+#: restoring from the seed stops after a run of unused addresses -- commonly
+#: 20 -- so a shop that allocates past that puts real money where a restore
+#: will not look. Refusing new sales is the backpressure; raising the wallet's
+#: gap limit and raising this together is the other half.
 UNPAID_RUN_LIMIT = int(os.environ.get("CRYPTOPOS_UNPAID_RUN_LIMIT", "15"))
 STATE_FILE = pathlib.Path(os.environ.get("CRYPTOPOS_STATE", ".checkout-state.json"))
 
@@ -120,6 +120,10 @@ class Sales:
 
 	def create(self, sale):
 		with self._lock:
+			if sale["id"] in self._sales:
+				# Silently replacing a sale loses the earlier one's address and
+				# its claim; refusing is the only safe answer to an id clash.
+				raise ValueError(f"a sale with id {sale['id']} already exists")
 			self._sales[sale["id"]] = sale
 		return sale
 
@@ -193,6 +197,30 @@ class Sales:
 			                  f"{result.credited_native} creditable")
 			return True
 
+	def lease(self, sale_id, now, seconds=30):
+		"""Take exclusive ownership of a sale from observation to terminal write.
+
+		A conditional write is not enough on its own. Two workers can read the
+		chain at different moments and reach different conclusions, and then
+		FIRST writer wins rather than best evidence: a worker that saw one
+		confirmation writes `needs-review` while a worker that saw three is
+		still deciding, and its `settled` loses the compare-and-set. The paid
+		sale never settles. Whoever holds the lease is the only one who may
+		observe and decide, which removes the disagreement rather than
+		arbitrating it.
+		"""
+		with self._lock:
+			sale = self._sales.get(sale_id)
+			if sale is None or sale["state"] != "pending" or now < sale["leased_until"]:
+				return False
+			sale["leased_until"] = now + seconds
+			return True
+
+	def release(self, sale_id):
+		with self._lock:
+			if sale_id in self._sales:
+				self._sales[sale_id]["leased_until"] = 0
+
 	def expire(self, sale_id, now):
 		"""Stop watching a sale whose window closed with nothing in it."""
 		with self._lock:
@@ -265,6 +293,16 @@ class Recipients:
 				"CRYPTOPOS_XPUB is a master key (depth 0). Use the ACCOUNT key your wallet "
 				"exports -- m/84'/1'/0' for testnet segwit, m/44'/60'/0' for EVM -- so that "
 				"0/index is a path your wallet actually watches.")
+		if self._account is not None:
+			# AND THAT IS ALL THIS CAN PROVE. A BIP-32 key does not carry its
+			# own path, so nothing here can tell an account key from another
+			# branch at the same depth. Refusing depth 0 removes the one case
+			# that IS provable; the rest is the operator's, and getting it
+			# wrong means money at addresses their wallet never scans. Say the
+			# depth out loud so a mistake is at least visible.
+			print("derivation: 0/index under a depth-"
+			      + str(self._account.depth)
+			      + " key -- check this is the account branch your wallet watches")
 		self._shared = shared_recipient
 		self._lock = threading.Lock()
 		self._open = {}
@@ -307,19 +345,28 @@ class Recipients:
 					f"{STATE_FILE} does not exist. If this really is a new deployment, start "
 					f"once with CRYPTOPOS_INIT=1 to create it. If it is not, find the file: "
 					f"allocating from zero would re-issue live receiving addresses.")
-			return {"next_index": 0, "static_used": False, "unpaid_run": 0}
+			return {"next_index": 0, "static_used": False, "highest_paid": -1}
 		try:
 			stored = json.loads(STATE_FILE.read_text())
 			index, used = stored["next_index"], stored["static_used"]
-			run = stored.get("unpaid_run", 0)
+			# NO DEFAULT. A state file written before this field existed says
+			# nothing about which of its indices were used, and reading that
+			# silence as "none unused" permits exactly the over-allocation the
+			# field exists to stop. Refuse and let an operator supply it.
+			if "highest_paid" not in stored:
+				raise ValueError("no 'highest_paid' recorded. An older state file cannot say "
+				                 "how long its run of unused addresses is; set it by hand "
+				                 "(-1 if nothing has been paid) once you know")
+			paid = stored["highest_paid"]
 			# EXACT TYPES. `int("12")` and `bool("false")` both succeed and
 			# both mean something other than what the file said; a coerced
 			# allocation counter is an allocation counter you do not know.
 			if (type(index) is not int or index < 0 or type(used) is not bool
-					or type(run) is not int or run < 0):
-				raise ValueError("next_index and unpaid_run must be non-negative JSON "
-				                 "integers and static_used a JSON boolean")
-			return {"next_index": index, "static_used": used, "unpaid_run": run}
+					or type(paid) is not int or paid < -1 or paid >= max(index, 1)):
+				raise ValueError("next_index must be a non-negative JSON integer, "
+				                 "static_used a JSON boolean, and highest_paid an integer "
+				                 "from -1 up to next_index - 1")
+			return {"next_index": index, "static_used": used, "highest_paid": paid}
 		except Exception as exc:
 			raise SystemExit(
 				f"{STATE_FILE} is unreadable ({exc}). Refusing to allocate: assuming zero "
@@ -345,7 +392,7 @@ class Recipients:
 			# reissue address zero.
 			handle.write(json.dumps({"next_index": state["next_index"],
 			                         "static_used": state["static_used"],
-			                         "unpaid_run": state["unpaid_run"]}))
+			                         "highest_paid": state["highest_paid"]}))
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, STATE_FILE)
@@ -405,7 +452,7 @@ class Recipients:
 					# disabling checkout.
 					self._static_spent = True
 					self._save({"next_index": state["next_index"], "static_used": True,
-					            "unpaid_run": state["unpaid_run"]})
+					            "highest_paid": state["highest_paid"]})
 					# THE ROLLBACK IS NOT CRASH-SAFE, and cannot be while
 					# `Sales` is in memory. If the process dies between here
 					# and `SALES.create`, the one permitted use is durably
@@ -419,31 +466,38 @@ class Recipients:
 				return -1, self._shared
 			with self._across_processes():
 				state = self._read_state()             # whole state, INSIDE the lock
-				if state["unpaid_run"] >= UNPAID_RUN_LIMIT:
+				# CONSECUTIVE UNUSED INDICES AFTER THE HIGHEST PAID ONE. Counting
+				# "allocations since the last payment" is a different number and
+				# not the one a wallet restore cares about: a late payment at
+				# index 0 reset that counter to zero while indices 1..n stayed
+				# unused, and the run kept growing unseen.
+				unused = state["next_index"] - 1 - state["highest_paid"]
+				if unused >= UNPAID_RUN_LIMIT:
 					# BACKPRESSURE, not a warning in a README. Every allocation
 					# is permanent, so a caller opening sales it never pays
 					# walks the wallet past its gap limit and hides real money
 					# from a restore. Refusing is the only thing that stops it.
 					raise ValueError(
-						f"{state['unpaid_run']} addresses have been issued since the last "
-						f"payment, and the limit is {UNPAID_RUN_LIMIT}. Raise the watching "
+						f"{unused} addresses after the last paid one are unused, and the "
+						f"limit is {UNPAID_RUN_LIMIT}. Raise the watching "
 						f"wallet's gap limit and CRYPTOPOS_UNPAID_RUN_LIMIT together, or wait "
 						f"for a sale to be paid.")
 				index = state["next_index"]
 				self._next = index + 1
 				# Durable BEFORE the address is shown.
 				self._save({"next_index": self._next, "static_used": state["static_used"],
-				            "unpaid_run": state["unpaid_run"] + 1})
+				            "highest_paid": state["highest_paid"]})
 			address = self._address(index)
 			self._open[sale_id] = address
 			return index, address
 
-	def paid(self):
-		"""A payment landed, so the run of unused addresses is over."""
+	def paid(self, index):
+		"""Record that THIS index received money, shortening the unused run."""
 		with self._lock, self._across_processes():
 			state = self._read_state()
 			self._save({"next_index": state["next_index"],
-			            "static_used": state["static_used"], "unpaid_run": 0})
+			            "static_used": state["static_used"],
+			            "highest_paid": max(state["highest_paid"], index)})
 
 	def commit(self, sale_id):
 		"""Mark this allocation as having become a sale a payer can see.
@@ -472,7 +526,7 @@ class Recipients:
 				state = self._read_state()
 				self._static_spent = False
 				self._save({"next_index": state["next_index"], "static_used": False,
-				            "unpaid_run": state["unpaid_run"]})
+				            "highest_paid": state["highest_paid"]})
 
 
 RAIL, CONFIG, RECIPIENTS, SERVER = None, None, None, None
@@ -528,7 +582,7 @@ def start_sale(amount_native):
 	# past its gap limit without ever being shown an address.
 	if not isinstance(amount_native, int) or amount_native <= 0:
 		raise ValueError("amount must be a positive integer in the asset's smallest unit")
-	sale_id = f"sale-{uuid.uuid4().hex[:12]}"
+	sale_id = f"sale-{uuid.uuid4().hex}"
 	index, recipient = RECIPIENTS.allocate(sale_id)
 	try:
 		return _open_sale(sale_id, amount_native, index, recipient)
@@ -557,11 +611,17 @@ def _open_sale(sale_id, amount_native, index, recipient):
 		baseline=baseline,
 	)
 	request = RAIL.create_request(intent)
+	# TRUST, THEN VERIFY. This is the string the customer's money follows, and
+	# a rail returning a cached or mismatched request would send it to another
+	# sale's address while this one watches its own.
+	if (request.rail_key, request.recipient, request.amount_native) != (
+			intent.rail_key, intent.recipient, intent.amount_native):
+		raise ValueError("the rail returned a payment request for a different payment")
 	sale = SALES.create({
 		"id": sale_id, "intent": intent, "uri": request.uri,
 		"amount_native": amount_native, "state": "pending", "reason": "",
 		"credited_native": 0, "sighted_native": 0, "transaction_ids": [],
-		"expires_at": intent.expires_at_epoch,
+		"expires_at": intent.expires_at_epoch, "leased_until": 0,
 		"recipient": recipient, "index": index, "notice": request.payer_notice,
 	})
 	# The address is spent HERE: the sale exists and its instruction is about
@@ -601,7 +661,7 @@ def poll_once(sale):
 	outcome = SALES.record(sale["id"], decision)
 	if outcome == CLAIMED:
 		if decision.state == "settled":
-			RECIPIENTS.paid()
+			RECIPIENTS.paid(sale["index"])
 		RECIPIENTS.close(sale["id"])
 		return PollResult(decision.state, decision.credited_native, decision.sighted_native,
 		                  decision.transaction_ids, decision.reason)
@@ -672,7 +732,7 @@ def demo_payer():
 			CONFIG["transfers"].append({
 				"id": f"tx-{sale['id'][-6:]}", "to": sale["recipient"],
 				"amount": sale["amount_native"], "confs": 3,
-				"height": CONFIG["tip"] - 5,
+				"height": CONFIG["tip"] - 5, "at": int(time.time()),
 			})
 
 
@@ -705,6 +765,8 @@ def _watch_loop():
 def _watch_one_pass(now):
 	"""One sweep over every open sale. Separated so it can be tested."""
 	for sale in SALES.open_sales():
+		if not SALES.lease(sale["id"], now):
+			continue                      # another worker owns this one
 		try:
 			# LOOK ONE MORE TIME BEFORE CALLING IT UNPAID. A payment that
 			# confirmed between the last poll and the deadline is money the
@@ -739,6 +801,8 @@ def _watch_one_pass(now):
 			# deterministically, and retrying it forever turns a paid sale
 			# into one nobody is told about.
 			print(f"  watch {sale['id']}: provider unavailable: {exc}")
+		finally:
+			SALES.release(sale["id"])
 		# Anything that is not a provider error propagates to `watcher`,
 		# which stops the service. Retrying a deterministic fault forever
 		# turns a paid sale into one nobody is ever told about.

@@ -2,8 +2,8 @@
 
 ## 2.2.0
 
-Eight rounds of adversarial review of the cookbook, the reference example and
-the gate over both found sixty-two defects. Nothing in the payment protocol
+Nine rounds of adversarial review of the cookbook, the reference example and
+the gate over both found seventy-four defects. Nothing in the payment protocol
 changed; everything below is the library's testing surface, its documentation,
 and the checks that keep them honest.
 
@@ -191,6 +191,37 @@ and the checks that keep them honest.
     and the sale goes straight to review rather than out of the door.
   - `MemoryRail` now reports the creditable amount on a pending decision, so a
     host can test part payments at all.
+* A ninth round found twelve more:
+  - **The backpressure counter measured the wrong quantity.** A wallet's gap
+    limit is about consecutive UNUSED indices after the highest used one; the
+    counter measured allocations since the last payment, so a late payment at
+    index 0 reset it to zero while indices 1..n stayed unused and the real run
+    kept growing. It tracks `highest_paid` now, and a state file written before
+    that field existed is refused rather than read as "nothing unused".
+  - **Expiry did not establish when a payment arrived.** `MemoryRail` had no
+    notion of block time, so a transfer added after a sale's deadline settled
+    normally and the README's "expiry is a cutoff on the payer" described
+    something that never happened. A scripted transfer can now carry `at`, and
+    a transfer that landed after the window is sighted and never creditable.
+  - **A terminal write could beat a better-informed one.** Two workers reading
+    the chain a block apart disagree, and a conditional write makes the FIRST
+    one win: a `needs-review` from a stale read beat a `settled` from a fresh
+    one and the paid sale never settled. A per-sale lease means one worker owns
+    a sale from observation through to its terminal write.
+  - An unresolved read was terminal. "I could not find out" is the absence of a
+    decision, so one transient provider hiccup made a sale a person had to
+    rescue; it stays pending and is asked again. `needs-review` is now
+    demonstrated with the case that really is terminal -- money that arrived
+    after the window closed.
+  - `create_request` is checked against its intent before the URI is shown. It
+    is the string the customer's money follows, and a rail returning a cached
+    request would send it to another sale's address.
+  - Sale ids use the full uuid4 rather than 48 bits of it, and a duplicate is
+    refused instead of silently replacing the sale it collided with.
+  - Three limits the example cannot close are now stated in the README rather
+    than implied away: a BIP-32 key cannot prove its own derivation path, a
+    restored older state file is valid JSON that rolls the allocator backwards,
+    and late money is never misattributed but is not recovered either.
 
 ## 2.1.1
 

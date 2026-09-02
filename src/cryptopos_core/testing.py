@@ -10,6 +10,11 @@ all reachable with no network, no funds, and no waiting.
 	rail = MemoryRail()
 	chain = {"endpoint": "memory://", "tip": 60, "page": 20, "transfers": []}
 
+A scripted transfer is a dict with `id`, `to`, `amount`, `confs` and `height`,
+plus an optional `at` -- the epoch second of the block carrying it. Supply `at`
+to exercise a host's expiry rule: a transfer that landed after the intent's
+window is sighted and never creditable.
+
 It ships in the wheel on purpose. A test double that is only in the repository
 is a test double the people integrating this library do not have, and testing
 the failure paths is the part of a payment integration nobody should have to
@@ -121,7 +126,8 @@ class MemoryRail:
 		transfers = tuple(
 			TransferObservation(t["id"], t["amount"], False, 0)
 			if t.get("unreadable") or not t["confs"] else
-			TransferObservation(t["id"], t["amount"], True, t["confs"], t["height"])
+			TransferObservation(t["id"], t["amount"], True, t["confs"], t["height"],
+			                    t.get("at"))
 			for t in visible
 		)
 		unresolved = tuple(t["id"] for t in visible if t.get("unreadable"))
@@ -133,11 +139,27 @@ class MemoryRail:
 	def settle(self, intent, observations, claimed_transaction_ids=frozenset()):
 		observations.require_intent(intent)
 		sighted = sum(t.amount_native for t in observations.transfers)
+		# A TRANSFER THAT LANDED AFTER THE WINDOW CLOSED IS NOT CREDITABLE.
+		# Without a block time the double could not tell a timely payment from
+		# a late one, so a sale whose deadline had passed settled anyway and a
+		# host's expiry rule described something that never happened.
+		late = [t for t in observations.transfers
+		        if t.block_time_epoch is not None and t.block_time_epoch > intent.expires_at_epoch]
 		usable = [t for t in observations.transfers
-		          if t.confirmations >= 1 and t.transaction_id not in claimed_transaction_ids]
+		          if t.confirmations >= 1 and t not in late
+		          and t.transaction_id not in claimed_transaction_ids]
 		credited = sum(t.amount_native for t in usable)
 		if observations.unresolved_transaction_ids:
-			return SettlementDecision("needs-review", 0, sighted, reason="a transaction could not be read")
+			# NOT A VERDICT, SO NOT TERMINAL. "I could not find out" is the
+			# absence of a decision; making it `needs-review` on the first
+			# failed read turns one transient provider hiccup into a sale a
+			# person has to rescue. It stays pending and is asked again -- and
+			# a host whose window has closed can then review it deliberately.
+			return SettlementDecision("pending", 0, sighted,
+			                          reason="a transaction could not be read yet")
+		if late:
+			return SettlementDecision("needs-review", 0, sighted,
+			                          reason="a transfer arrived after the payment window closed")
 		if credited >= intent.amount_native:
 			return SettlementDecision("settled", credited, sighted,
 			                          tuple(t.transaction_id for t in usable))

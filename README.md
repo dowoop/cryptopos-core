@@ -309,6 +309,15 @@ address and is not; there isn't one.
 gives you `cryptopos_core.testing`, which every recipe here uses; clone the
 repository for the server.)
 
+**Three things the example cannot do for you, stated rather than implied.** A
+BIP-32 key does not carry its own path, so nothing can tell an account key from
+another branch at the same depth — refusing a master key removes the only case
+that is provable, and the rest is yours to get right. A restored *older* state
+file is valid JSON and rolls the allocator backwards; only an external identity
+for the allocator can catch that. And a payment that lands after a sale expired
+is never misattributed — the address is not reused — but nothing here goes back
+to look for it, so late money needs wallet reconciliation you build separately.
+
 The three pieces worth lifting into your own app, whatever it is written in:
 
 **Build the registry once, at start-up, not per request.** `discover()` reads
@@ -623,19 +632,33 @@ The example does exactly that.
 together. A settled decision can never carry zero ids; the dataclass refuses to
 be constructed that way.
 
-**`needs-review`** — the rail saw money and will not decide whose it is, or
-could not establish a transaction's status at all. This is the state that
-protects you. Here the provider was asked about a transfer and did not answer:
+**`needs-review`** — the rail saw money it will not credit and will not guess
+about. This is the state that protects you. Here a transfer arrived after the
+sale's window had closed: it is real money, at the right address, and not this
+sale's to take:
+
+```python
+late = {**chain, "transfers": [
+    {"id": "tx-late", "to": "mem1alice", "amount": 250, "confs": 3,
+     "height": 71, "at": intent.expires_at_epoch + 1},
+]}
+verdict = rail.settle(intent, rail.observe(intent, late))
+verdict.state                            # -> 'needs-review'
+verdict.credited_native                  # -> 0
+verdict.sighted_native                   # -> 250
+```
+
+Compare that with a read that simply failed. "I could not find out" is the
+*absence* of a decision, so it stays retryable rather than becoming a case for
+a person on the first hiccup:
 
 ```python
 doubted = {**chain, "transfers": [
     {"id": "tx-?", "to": "mem1alice", "amount": 250, "confs": 3,
      "height": 71, "unreadable": True},      # the provider was asked; it did not answer
 ]}
-verdict = rail.settle(intent, rail.observe(intent, doubted))
-verdict.state                            # -> 'needs-review'
-verdict.credited_native                  # -> 0
-verdict.sighted_native                   # -> 250
+rail.settle(intent, rail.observe(intent, doubted)).state
+#   -> 'pending'
 ```
 
 `sighted_native` is 250 while `credited_native` is 0: the rail reports what it
@@ -643,10 +666,9 @@ saw *and* what it was willing to credit, and the gap is exactly what a human
 has to look at. **Never resolve `needs-review` automatically**, and give it a
 real destination — a status string nobody queries is not a queue.
 
-The distinction that makes this state worth having is between *"the chain says
-this money did not move"* and *"I could not find out"*. The first is a
-decision; the second is the absence of one, and a terminal state taken on it is
-a sale lost to a transient read.
+That is the distinction worth holding on to: *"the chain says this money is not
+yours"* is a decision, and *"I could not find out"* is the absence of one. A
+terminal state taken on the second is a sale lost to a transient read.
 
 ## 8. Write your own rail
 

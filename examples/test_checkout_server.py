@@ -39,11 +39,11 @@ class Harness(unittest.TestCase):
 		self.addCleanup(os.environ.pop, "CRYPTOPOS_INIT", None)
 		app.RECIPIENTS = app.Recipients(app.RAIL, app.DEMO_XPUB, "")
 
-	def pay(self, sale, amount, height, txid):
+	def pay(self, sale, amount, height, txid, at=None):
 		app.CONFIG["tip"] = max(app.CONFIG["tip"], height + 5)
 		app.CONFIG["transfers"].append({
 			"id": txid, "to": sale["recipient"], "amount": amount,
-			"confs": 3, "height": height,
+			"confs": 3, "height": height, "at": at or (sale["expires_at"] - 60),
 		})
 
 
@@ -167,7 +167,43 @@ class OneTransferOneInvoice(Harness):
 		self.assertEqual(app.SALES.get(sale["id"])["credited_native"], 100)
 
 
+class MoneyMustArriveInTime(Harness):
+	def test_a_transfer_after_the_window_is_not_credited(self):
+		"""Expiry is a cutoff on the payer. Without a block time the example
+		could not tell a timely payment from a late one, and a sale whose
+		deadline had passed settled anyway."""
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "too-late", at=sale["expires_at"] + 1)
+		result = app.poll_once(sale)
+		self.assertEqual(result.state, "needs-review")
+		self.assertEqual(result.credited_native, 0)
+		self.assertEqual(result.sighted_native, 100)
+
+	def test_a_transfer_inside_the_window_is_credited(self):
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "in-time", at=sale["expires_at"] - 1)
+		self.assertEqual(app.poll_once(sale).state, "settled")
+
+
 class TheGapLimitIsDefended(Harness):
+	def test_a_late_payment_low_down_does_not_hide_the_unused_run(self):
+		"""The invariant is consecutive unused indices after the highest PAID
+		one. Counting allocations since the last payment let a late payment at
+		index 0 reset the counter while indices 1..n stayed unused."""
+		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
+		try:
+			first = app.start_sale(100)
+			for _ in range(2):
+				app.start_sale(1)
+			self.pay(first, 100, 71, "late-but-low")
+			self.assertEqual(app.poll_once(first).state, "settled")
+			# index 0 is paid; 1 and 2 are unused; one more reaches the limit.
+			app.start_sale(1)
+			with self.assertRaises(ValueError):
+				app.start_sale(1)
+		finally:
+			app.UNPAID_RUN_LIMIT = original
+
 	def test_valid_but_unpaid_sales_eventually_get_backpressure(self):
 		"""Validating the amount only changed the attacker's payload from 0
 		to 1. Every allocation is permanent, so a caller opening sales it
@@ -181,7 +217,7 @@ class TheGapLimitIsDefended(Harness):
 		finally:
 			app.UNPAID_RUN_LIMIT = original
 
-	def test_a_payment_ends_the_unpaid_run(self):
+	def test_a_payment_at_the_top_shortens_the_unused_run(self):
 		original, app.UNPAID_RUN_LIMIT = app.UNPAID_RUN_LIMIT, 3
 		try:
 			for _ in range(2):
@@ -189,9 +225,19 @@ class TheGapLimitIsDefended(Harness):
 			paid = app.start_sale(100)
 			self.pay(paid, 100, 71, "a-real-payment")
 			self.assertEqual(app.poll_once(paid).state, "settled")
-			self.assertIsNotNone(app.start_sale(1))     # the run reset
+			self.assertIsNotNone(app.start_sale(1))     # nothing after it is unused
 		finally:
 			app.UNPAID_RUN_LIMIT = original
+
+	def test_an_old_state_file_without_the_field_is_refused(self):
+		"""It cannot say how long its run of unused addresses is, and reading
+		that silence as zero permits the over-allocation the field prevents."""
+		app.STATE_FILE.write_text('{"next_index": 100, "static_used": false}')
+		with self.assertRaises(SystemExit) as refused:
+			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
+		# Naming the field is not enough -- a bare KeyError does that. The
+		# refusal has to tell an operator what to do about it.
+		self.assertIn("set it by hand", str(refused.exception))
 
 
 class TheDoubleModelsRealChainStates(Harness):
@@ -488,9 +534,11 @@ class KeysAndStateAreChecked(Harness):
 
 	def test_coerced_state_is_refused(self):
 		"""int("12") succeeds and means something the file did not say."""
-		app.STATE_FILE.write_text('{"next_index": "12", "static_used": false}')
-		with self.assertRaises(SystemExit):
+		app.STATE_FILE.write_text(
+			'{"next_index": "12", "static_used": false, "highest_paid": -1}')
+		with self.assertRaises(SystemExit) as refused:
 			app.Recipients(app.RAIL, app.DEMO_XPUB, "")
+		self.assertIn("non-negative JSON integer", str(refused.exception))
 
 	def test_a_static_allocator_cannot_roll_the_counter_backwards(self):
 		"""It re-read only its own flag and wrote a cached index, reissuing
@@ -524,14 +572,57 @@ class NoSaleIsHandedOutUnwatched(Harness):
 		self.assertEqual(len(app.SALES.in_review()), 1)
 
 
+class OneWorkerOwnsASale(Harness):
+	def test_a_lease_stops_a_second_worker_touching_the_same_sale(self):
+		"""A conditional write is not enough: two workers reading the chain a
+		block apart disagree, and then FIRST writer wins rather than best
+		evidence -- a `needs-review` from a stale read can beat a `settled`."""
+		sale = app.start_sale(100)
+		now = int(time.time())
+		self.assertTrue(app.SALES.lease(sale["id"], now))
+		self.assertFalse(app.SALES.lease(sale["id"], now))
+		app.SALES.release(sale["id"])
+		self.assertTrue(app.SALES.lease(sale["id"], now))
+
+	def test_a_leased_sale_is_skipped_by_the_sweep(self):
+		sale = app.start_sale(100)
+		self.pay(sale, 100, 71, "paid")
+		app.SALES.lease(sale["id"], int(time.time()))       # someone else owns it
+		app._watch_one_pass(int(time.time()))
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "pending")
+		app.SALES.release(sale["id"])
+		app._watch_one_pass(int(time.time()))
+		self.assertEqual(app.SALES.get(sale["id"])["state"], "settled")
+
+
+class RequestsAreCheckedAgainstTheirSale(Harness):
+	def test_a_request_for_another_payment_is_refused(self):
+		"""This is the string the customer's money follows."""
+		original = app.RAIL.create_request
+
+		def wrong(intent):
+			request = original(intent)
+			return type(request)(request.rail_key, request.uri, "mem1someone-else",
+			                     request.amount_native, request.payer_notice)
+
+		app.RAIL.create_request = wrong
+		with self.assertRaises(ValueError):
+			app.start_sale(100)
+
+	def test_a_duplicate_sale_id_is_refused(self):
+		sale = app.start_sale(100)
+		with self.assertRaises(ValueError):
+			app.SALES.create(dict(sale))
+
+
 class LateWorkersGetTheTruth(Harness):
 	def test_the_stored_outcome_keeps_what_was_sighted(self):
 		"""Reporting sighted from credited erases the evidence a reviewer needs."""
 		sale = app.start_sale(250)
-		app.CONFIG["tip"] = 100
-		app.CONFIG["transfers"].append({
-			"id": "tx-?", "to": sale["recipient"], "amount": 250,
-			"confs": 3, "height": 71, "unreadable": True})
+		# A LATE transfer is a terminal review case: real money, at the right
+		# address, and not this sale's to take. (An unreadable one is not --
+		# that stays pending, because it is the absence of an answer.)
+		self.pay(sale, 250, 71, "arrived-late", at=sale["expires_at"] + 1)
 		self.assertEqual(app.poll_once(sale).state, "needs-review")
 
 		late = app._stored_decision(sale["id"])
