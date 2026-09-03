@@ -6,8 +6,13 @@ instruction, watches for the money, and returns a settlement decision. Your
 application keeps the database, the scheduler, and the sale.
 
 ```bash
-pip install cryptopos-core cryptopos-rail-bitcoin
+pip install git+https://github.com/dowoop/cryptopos-core
+pip install git+https://github.com/dowoop/cryptopos-rail-bitcoin
 ```
+
+**Not on PyPI yet**, so `pip install cryptopos-core` does not resolve — the repository is the
+distribution until the name is registered. Install core first: a rail declares `cryptopos-core` as a
+dependency and there is no index for pip to satisfy it from.
 
 Zero dependencies, standard library only. Works in a web app, an ERP, a till, a
 bot, or a script with nothing under it.
@@ -26,8 +31,14 @@ complete checkout — form, QR, polling, settlement — in one stdlib file you c
 run right now with no chain, no funds, and no configuration:
 
 ```bash
+git clone https://github.com/dowoop/cryptopos-core && cd cryptopos-core
 CRYPTOPOS_INIT=1 python3 examples/checkout_server.py     # http://127.0.0.1:8099
 ```
+
+`examples/` ships in the repository and the sdist, **not in the wheel**, so an
+install alone does not give you that file — clone for the server. Every
+*recipe* below needs only the install: they use `cryptopos_core.testing`, which
+is in the wheel.
 
 ## Status — read this before you take money with it
 
@@ -295,7 +306,7 @@ addresses that may already be live.
 Point it at a real chain with environment variables and no code change:
 
 ```bash
-pip install cryptopos-rail-bitcoin
+pip install git+https://github.com/dowoop/cryptopos-rail-bitcoin
 CRYPTOPOS_RAIL=bitcoin:testnet4/native:btc \
 CRYPTOPOS_ENDPOINT=https://mempool.space/testnet4/api \
 CRYPTOPOS_XPUB=tpub... python3 examples/checkout_server.py
