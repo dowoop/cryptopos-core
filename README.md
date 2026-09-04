@@ -111,24 +111,50 @@ project real money at least once:
    that was shown to a payer can still be paid, so a finished sale's QR settles
    whatever sale holds that address next. Derive an address per sale, allocate
    each one once, and never reissue it.
-2. **Claim `decision.transaction_ids` exclusively — per recipient — in the
-   same write as the settled state.** `settle` is pure: it credits whatever you
+2. **Claim `decision.transaction_ids` exclusively — per payment binding — in
+   the same write as the settled state.** `settle` is pure: it credits whatever you
    did not tell it was already spent. Reading the claimed set, settling, then
    writing is the obvious shape and it is wrong — two workers read the same set
    before either writes, and one transfer settles two invoices. What saves you
    is that claiming can *fail*: a `PRIMARY KEY` over the claim, and the losing
    `INSERT` rolling back the sale state with it.
-   **Key it on `(rail, recipient, transaction_id)`, not the id alone.** A transaction
-   id is not an exclusive payment identifier: one chain transaction can carry
-   outputs to several addresses, so an exchange batching its withdrawals pays
-   two of your sales at once. Claiming the bare id settles the first and leaves
-   the second — whose customer really paid — looking unpaid. Reproduced against
-   the example here. Scoping by recipient is exact precisely *because* of
-   obligation 1: two sales never share an address, so they never share a
-   (recipient, transaction) pair, while the same output still cannot be
-   credited twice to the sale that owns that address. The rail belongs in the
-   key too: transaction ids and address strings are per-network, and two rails
-   can mint the same-looking pair.
+   **Key it on `(rail, recipient, transaction_id)` when obligation 1 gives each
+   sale a recipient that is never reissued.** `PaymentIntent.payment_reference`
+   may repeat in that model because the recipient supplies the attribution.
+   **For a recipient shared by design, key it on `(rail, recipient,
+   payment_reference, transaction_id)` only if every sale has a unique,
+   never-reissued `PaymentIntent.payment_reference` *and* the rail exposes only
+   transfers whose authenticated on-chain instruction or event carries that
+   exact reference.** A host-generated reference alone binds nothing. Without
+   that protocol-bound reference, a shared recipient is unsafe at any claim-key
+   width: no uniqueness constraint can repair the missing attribution.
+   Reproduced against `MemoryRail`: two intents with the same recipient,
+   different unique payment references and one shared transaction both settled
+   on `tx-one`.
+
+   A transaction id is not an exclusive payment identifier: one chain
+   transaction can carry outputs to several addresses, so an exchange batching
+   its withdrawals pays two of your sales at once. Claiming the bare id settles
+   the first and leaves the second — whose customer really paid — looking
+   unpaid. Reproduced against the example here. The recipient-scoped form is
+   exact precisely *under obligation 1's rule*: two sales never share an
+   address, so they never share a (recipient, transaction) pair, while the same
+   output still cannot be credited twice to the sale that owns that address.
+   The reference-scoped form is exact precisely under both of its rules: two
+   sales never share a verified payment reference, while one transaction can
+   still satisfy both when it carries a payment for each reference.
+
+   If both models share one claims table, normalize them into one non-null
+   scope: for example, `claim_scope = 'recipient'` for recipient-bound rows and
+   `claim_scope = 'reference:' || PaymentIntent.payment_reference` for
+   reference-bound rows, with `claim_scope NOT NULL` and `PRIMARY KEY (rail,
+   recipient, claim_scope, transaction_id)`. Do not put `NULL` in a nullable
+   `payment_reference` column for the first model: `NULL` values do not collide
+   under SQL uniqueness, so the losing `INSERT` need not lose. Reproduced on
+   SQLite: it accepted the identical recipient-bound claim twice under that
+   nullable four-column key. The rail belongs in every key too: transaction ids
+   and address strings are per-network, and two rails can mint the same-looking
+   pair.
 3. **Capture the baseline before the payer sees the request.** It pins the
    chain position the sale starts from. Capture it late and a transfer that
    predates the sale can be credited to it.
