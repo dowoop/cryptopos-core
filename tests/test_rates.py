@@ -308,8 +308,8 @@ class Constants(unittest.TestCase):
 		direction and still true of every asset absent from this table.
 
 		`xtr` was added because Tari is listed on NONE of the feeds this build
-		reads. `live_tari_watch.py` re-measured it on 2026-08-28 and returned
-		"NOTHING CHANGED", with Coinbase answering 404 for XTM-USD. Without an
+		reads. It was re-measured on 2026-08-28 and returned "NOTHING
+		CHANGED", with Coinbase answering 404 for XTM-USD. Without an
 		entry the rail raises `RateUnavailable` and cannot be charged at all,
 		even on a testnet where nothing is at stake -- so the choice was a
 		picked number or no Ootle rail.

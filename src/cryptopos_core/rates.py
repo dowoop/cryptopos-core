@@ -64,8 +64,8 @@ DEMO_MICROCENTS = {
 	# not a price anybody quoted, which is exactly what this table is for and
 	# why it can never be reached in a real-money mode.
 	#
-	# Tari is listed on none of the feeds here -- re-measured 2026-08-28 by
-	# `live_tari_watch.py`, verdict "NOTHING CHANGED", Coinbase answering 404
+	# Tari is listed on none of the feeds here -- re-measured 2026-08-28,
+	# verdict "NOTHING CHANGED", with Coinbase answering 404
 	# for XTM-USD -- so without an entry the rail raises `RateUnavailable` and
 	# cannot be charged at all, even on a testnet where nothing is at stake.
 	#

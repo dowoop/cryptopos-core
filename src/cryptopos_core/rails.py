@@ -5,8 +5,8 @@ state. Every field here answers a question some surface asks, and they sit
 side by side so a drift between them is a one-screen read rather than a
 scavenger hunt.
 
-Carried across from the tkinter terminal's `rails.py` unchanged, including
-the maturity notes. A rail that says `works` and a rail that says `partial`
+Carried across unchanged from the application this package was extracted
+from, maturity notes included. A rail that says `works` and a rail that says `partial`
 are making different promises to the operator, and dropping the distinction
 on the way across would be the first overclaim of the port.
 
@@ -55,13 +55,16 @@ arithmetic and `chargeable_in_mode()` also stay out, for a plainer reason:
 they read operator config and measured timing state, and none of them can be
 confirmed without the host they came from.
 
-**A note on the comments below.** They are carried over verbatim, and several
-cite things outside this package -- `watchers.py`, `simulator.py`,
-`pos_actions`, `harnesses/`, `CHARTER.md`, `rates.unpriced_assets()`, "the
-vault". Those all name parts of the tkinter terminal this table came from.
-They are kept because each one records WHY a number is what it is, and a
-measured value with its provenance stripped off is just a magic number. Read
-them as citations, not as imports.
+**A note on the comments below.** They are carried over from the terminal this
+table was measured in, and they record WHY a number is what it is: which
+transport answered, what was measured, and on what date. A measured value with
+its provenance stripped off is just a magic number, so the reasoning is kept.
+
+What is NOT kept is the filenames. They named parts of an application you
+cannot open, which asks a reader to take a citation on faith and go nowhere --
+worse than no citation, because it looks checkable. Each comment now states the
+fact itself. Where a number came from a measurement, the date it was measured
+is given, and that is the part you can hold this table to.
 """
 
 from types import MappingProxyType
@@ -115,9 +118,10 @@ RAILS = {
 		# proper name (chains name their testnets like pets).
 		#
 		# Bitcoin's testnet endpoint is NOT JSON-RPC: it's an Esplora
-		# REST explorer API (the indexer pattern the vault names).
-		# testnet_transport tells watchers.py to use call_rest there;
-		# demo keeps teaching the Bitcoin Core RPC dialect.
+		# REST explorer API -- an indexer rather than a node, the same
+		# shape the Ootle rail reads. testnet_transport tells a host to
+		# use REST calls there rather than an RPC dialect; demo keeps
+		# teaching the Bitcoin Core RPC dialect.
 		#
 		# real_transport (this rail's and every other's) describes what
 		# a PRODUCTION deployment would ride - WS subscriptions for
@@ -312,8 +316,8 @@ RAILS = {
 							" Monero cannot be watched from a public explorer"
 							" by construction, so this rail is local-first.",
 		"sidecar": "monero-wallet-rpc",
-		# Measured 2026-07-27 against a real sidecar (see harnesses/
-		# live_xmr.py): a view-only wallet answers `get_height`,
+		# Measured 2026-07-27 against a real sidecar: a view-only
+		# wallet answers `get_height`,
 		# `create_address` and `get_transfers`, and REFUSES
 		# `query_key(spend_key)` with -29 "The wallet is watch-only."
 		"sidecar_command": "monero-wallet-rpc --stagenet --daemon-address"
@@ -371,9 +375,9 @@ RAILS = {
 	# and it is parked forever for this terminal: gRPC-only transport,
 	# which a stdlib-only Python build cannot speak at all. Ootle is
 	# the same money at layer two and its indexer is **HTTPS + JSON** -
-	# exactly what `ootle_read.py` has been reading since 2026-08-04
-	# with `urllib`. So the rail that could not be built at L1 builds
-	# itself at L2, out of a module that already existed.
+	# readable with `urllib` alone, and read that way in production
+	# since 2026-08-04. So the rail that could not be built at L1
+	# builds itself at L2, with no dependency the other rails lack.
 	#
 	# MEASURED BEFORE IT WAS WRITTEN, and the finding that decided the
 	# design: an XTR balance in an account vault is a `Stealth`
@@ -402,16 +406,15 @@ RAILS = {
 		# can never fill, because an exchange lists the asset and not
 		# the layer. So this rail asks for XTM's price, and the day two
 		# feeds list it this rail becomes chargeable with no edit here -
-		# `rates.unpriced_assets()` is derived from the tables rather
+		# which asset is unpriced is DERIVED from these tables rather
 		# than written down as a verdict, which is the whole point of
 		# encoding the inequality instead of today's conclusion.
 		"price_asset": "XTM",
 		# NO CONFIRMATION DEPTH, and this is a property of the consensus
 		# rather than a gap. Ootle finality is BFT: a transaction is
-		# committed or it is not, there is no reorg to outlive, and
-		# `harnesses/measurements/2026-07-31-ootle-finality-3.json`
-		# measured the cycle at 58.7 s with a free-phase median of
-		# 29.2 s. Waiting "3 more of something" would be waiting for a
+		# committed or it is not, there is no reorg to outlive, and the
+		# cycle was measured on 2026-07-31 at 58.7 s with a free-phase
+		# median of 29.2 s. Waiting "3 more of something" would be waiting for a
 		# thing that does not happen here.
 		"gate_confs": None,
 		"gate_text": "with a payment component: deposits naming THIS sale's"
@@ -445,18 +448,18 @@ RAILS = {
 							" can be agreed - the watch path is built and the"
 							" quote is what is missing.",
 		# AND NO SIMULATOR, WHICH IS THE ONE RAIL THAT DOES NOT HAVE ONE.
-		# `simulator.py` teaches eight real node dialects; Ootle's real
+		# A demo mode teaches eight real node dialects; Ootle's real
 		# transport is a REST indexer with five documented GETs, and a
 		# ninth personality would be a dialect this build INVENTED rather
-		# than one it learned. That is the opposite of what that file is
-		# for. So demo is refused with a stated reason instead of being
+		# than one it learned. That is the opposite of what a simulator
+		# is for. So demo is refused with a stated reason instead of being
 		# answered by fiction - which also keeps the charge button from
 		# promising a mode it cannot honour.
 		"no_simulator": True,
-		# THE MAINNET ROW IS EMPTY ON PURPOSE and it is the same absence
-		# `ootle_net.py` records: Tari has published no mainnet indexer.
-		# A plausible URL here would turn "not launched" into "not
-		# answering".
+		# THE MAINNET ROW IS EMPTY ON PURPOSE: Tari has published no
+		# mainnet indexer, so there is nothing to point at. A plausible
+		# URL here would turn "not launched" into "not answering", which
+		# are different problems with different fixes.
 		"live_url": None,
 		"testnet_url": "https://ootle-indexer-a.tari.com",
 		"testnet_transport": "ootle-indexer-rest",
@@ -486,8 +489,8 @@ RAILS = {
 		# to the slow half it was written as a fallback.
 		#
 		# And note WHICH field Insight does carry: `txlock` is the
-		# InstantSend signal - the exact one the vault's Dash note says is
-		# display-only and must NEVER book income. The transport can see
+		# InstantSend signal - the exact one that is display-only and must
+		# NEVER book income. The transport can see
 		# the signal we are forbidden to use and cannot see the one we
 		# would settle on. That asymmetry is why the lock below is 1200s.
 		"gate_text": "confs >= 6 (ChainLock would settle in ~1 block, but the"
@@ -662,12 +665,12 @@ def earns_policy_points(rail):
 	and the Ootle rail that would offer them cannot be charged in a real mode
 	because Tari is listed on no exchange feed. So loyalty is, today, offered
 	on nothing. That is the honest consequence of the rule and not a defect in
-	it: `rates.unpriced_assets()` is derived from measured feed tables rather
+	it: which asset is unpriced is derived from measured feed tables rather
 	than written down as a verdict, so the day two feeds list Tari, this rail
 	becomes chargeable and loyalty starts working again with no code change.
 	The inequality is encoded; the conclusion is not.
 
-	Deliberately NOT a `merchant.json` switch. A switch would make it a thing
+	Deliberately NOT an operator switch. A switch would make it a thing
 	an operator turns off on a busy afternoon, and the reason it exists is an
 	asset-management property of the whole programme rather than a preference
 	about one till.
@@ -737,10 +740,10 @@ def usd_cents_to_native(rail, usd_cents, rate_microcents=None):
 def native_to_usd_cents(rail, native_units, rate_microcents=None):
 	"""
 	The inverse, same two-step (native -> display units -> cents) so no
-	float ever appears. Lives here beside its forward twin rather than in
-	pos_actions, because they must round the same way or a sale that paid
-	exactly reads as a cent short - see h_B2, which measures precisely
-	that. Same `rate_microcents` contract as above.
+	float ever appears. Lives here beside its forward twin rather than in a
+	host's own sale arithmetic, because the two must round the same way or a
+	sale that paid exactly reads as a cent short -- which was measured, and is
+	why they are neighbours. Same `rate_microcents` contract as above.
 	"""
 	if rate_microcents is None:
 		rate_microcents = rail_demo_microcents(rail)

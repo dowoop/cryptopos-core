@@ -91,7 +91,7 @@ indent-style = "tab"
 # `[tool.ruff] exclude` above keeps the LINTER off it, but the formatter does
 # not read that list -- `make fmt` rewrote 774 of its lines, which is exactly
 # the one thing the file must never suffer. Byte-identical to upstream and to
-# the tkinter terminal's copy is the property that makes it the same encoder
+# every other copy of it is the property that makes it the same encoder
 # on every surface, and `test_packaging.VendoredGenerator` only checks the
 # notice survived, not the bytes. Excluded here, where the formatter looks.
 # `README.md` — ruff formats code blocks inside markdown, and this package
@@ -115,6 +115,6 @@ ignore = [
 ]
 
 # Vendored unchanged from Project Nayuki (MIT). Reformatting it would destroy
-# the one property that matters: that it is byte-identical to the copy the
-# tkinter terminal uses, and to upstream.
+# the one property that matters: that it is byte-identical to upstream, and
+# therefore to every other copy of it.
 exclude = ["src/cryptopos_core/qrcodegen.py"]

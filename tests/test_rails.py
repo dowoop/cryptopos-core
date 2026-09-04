@@ -99,8 +99,8 @@ class TableShape(unittest.TestCase):
 				self.assertIn(rail["maturity"], MATURITIES)
 
 	def test_the_maturity_census_is_what_the_docs_claim(self):
-		# README and DEVELOPMENT.md both state this split in prose. Prose
-		# decays silently; this is the line that makes it not.
+		# The README states this split in prose. Prose decays silently;
+		# this is the line that makes it not.
 		census = {}
 		for rail in rails.RAILS.values():
 			census[rail["maturity"]] = census.get(rail["maturity"], 0) + 1
@@ -420,9 +420,9 @@ class TwoConversionsThatDisagree(unittest.TestCase):
 	a deliberate truncation to the precision a human is shown.
 
 	This is pinned rather than reconciled because reconciling it changes what
-	a live terminal invoices: the Frappe app charges through `native_for`,
-	the tkinter terminal charges through `usd_cents_to_native`, and picking
-	one is a money decision rather than a tidy-up.
+	a live terminal invoices: one host charges through `native_for` and
+	another through `usd_cents_to_native`, and picking one for both is a
+	money decision rather than a tidy-up.
 	"""
 
 	def test_the_two_paths_differ_on_a_rail_with_room_between_the_decimals(self):
@@ -591,7 +591,7 @@ class ChargePathRequiresAnExplicitRate(unittest.TestCase):
 		)
 
 	def test_the_lower_level_helper_keeps_its_fallback(self):
-		# Unchanged for the tkinter terminal, which relies on it.
+		# Unchanged, because a host in the field relies on this path.
 		btc = rails.RAILS["btc"]
 		self.assertEqual(rails.usd_cents_to_native(btc, 1099), 17_171)
 

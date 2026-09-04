@@ -1,10 +1,10 @@
-"""QR encoding — the same generator the tkinter terminal uses.
+"""QR encoding — the same generator every surface of a deployment uses.
 
 `qrcodegen.py` is vendored unchanged (MIT, Project Nayuki) rather than
 swapped for a JavaScript library, so the symbol the customer scans off the
-screen is produced by the same encoder that produced it before the port. A QR
-that differs between two surfaces of the same terminal is a defect that only
-shows up at the counter.
+screen is produced by the same encoder that produced it before this package
+was extracted. A QR that differs between two surfaces of one deployment is a
+defect that only shows up at the counter.
 
 What crosses the wire is the module grid, not markup. A host that sanitises
 stored HTML will strip exactly the attributes an SVG needs -- `d` and `fill`

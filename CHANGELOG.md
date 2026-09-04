@@ -536,6 +536,6 @@ real funds move is one that will eventually be passed by accident.
 
 ## 0.1.0
 
-Extracted from the Frappe app: `rates`, `qr`, `chain`, `errors`, and the
+Extracted from the host application: `rates`, `qr`, `chain`, `errors`, and the
 vendored `qrcodegen`. Later joined by `rails` (12 rails, 8 families) and
 `uri` (one branch per scheme).

@@ -1,6 +1,7 @@
 """Payment URIs — one branch per scheme, and the QR encodes exactly these.
 
-Carried across from the tkinter terminal unchanged. The scheme, the amount
+Carried across unchanged from the application this package was extracted
+from. The scheme, the amount
 form and the network marker are each a decision some wallet enforces, so they
 are written once here rather than reconstructed at whatever surface happens to
 be drawing a code.

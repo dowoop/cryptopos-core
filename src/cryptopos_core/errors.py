@@ -1,8 +1,8 @@
 """Errors the core raises, and the reason it raises rather than reports.
 
-Most of this package refuses to raise. `chain.py` in particular is total by
-contract: a policy read that fails returns a sentinel and a reason, because a
-sale must never fail because the policy layer is down.
+Most of this package refuses to raise, and the rail readers built on it are
+total by contract: a policy read that fails returns a sentinel and a reason,
+because a sale must never fail because the policy layer is down.
 
 Money-boundary refusals are the exception, and deliberately. There is no
 honest sentinel for "this sale has no price" or "this payment URI is unsafe"
