@@ -17,6 +17,24 @@ dependency and there is no index for pip to satisfy it from.
 Zero dependencies, standard library only. Works in a web app, an ERP, a till, a
 bot, or a script with nothing under it.
 
+### Choose a rail
+
+Core is the protocol and drives nothing on a real network. The rail packages are
+separate distributions, and installing one *is* the integration — it registers
+itself through the `cryptopos.rails` entry-point group. Until 2026-09-04 this
+file named all three and linked to none of them, so a reader who started here,
+which is where the install line sends them, had no way out.
+
+| package | networks and assets | binding | obligations to read first |
+|---|---|---|---|
+| [`cryptopos-rail-bitcoin`](https://github.com/dowoop/cryptopos-rail-bitcoin) | Bitcoin testnet4 / TBTC | a fresh address per sale, derived from an xpub | [1](#five-host-obligations) — it is the rail that satisfies it |
+| [`cryptopos-rail-evm`](https://github.com/dowoop/cryptopos-rail-evm) | Ethereum Sepolia and Polygon Amoy, native and ERC-20 | **weakest here** — one address, reused | [1](#five-host-obligations) and its own warning box |
+| [`cryptopos-rail-ootle`](https://github.com/dowoop/cryptopos-rail-ootle) | Tari Ootle esmeralda / XTR | per-sale when a payment component is configured, shared without one | [2](#five-host-obligations) and its own warning box |
+
+Each rail's README covers only what is specific to it; the five calls, the
+settlement states and the [five host obligations](#five-host-obligations) are
+here.
+
 ```python
 from cryptopos_core.registry import RailRegistry
 
@@ -99,8 +117,12 @@ settle(intent, batch, claimed_ids)    pending | settled | needs-review
 `readiness(config)` sits outside the sale: ask it once at start-up to find out
 which rails this deployment can actually charge.
 
+### Five host obligations
+
 **The five things a host must get wrong-proof.** Each of these has cost this
-project real money at least once:
+project real money at least once. Three rail packages link to this heading by
+anchor, so it is part of their public documentation and does not get renamed
+casually:
 
 1. **Two open sales must not share a receiving address.** On any rail whose
    `binding_category` is `not-unconditional` — which is most of them — the
@@ -917,8 +939,12 @@ It is intentionally stricter than "a QR can be built".
 ## Installable rails, and what core drives
 
 **Core drives no rail on any real network.** `register_builtins()` registers six
-*request-only* catalogue entries — chains this package can describe and build a
-payment request for, and cannot observe or settle. Every rail that moves real
+catalogue entries, **five** of them *request-only* — chains this package can
+describe and build a payment request for, and cannot observe or settle. The
+sixth, Monero stagenet, carries no capability at all: it is named so that its
+absence is explicit rather than a gap a reader has to notice. Counting all six
+as request-only was wrong until 2026-09-04, and the table below always had it
+right, which is why nothing caught it. Every rail that moves real
 money is an installed package discovered through the `cryptopos.rails`
 entry-point group. Asking the registry for one without installing it raises
 `RailNotInstalled`, which is the honest answer rather than a stub.
